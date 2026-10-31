@@ -22,7 +22,8 @@ Ada  | 120
 
 ```bash
 make
-./build/quarry my.db          # REPL (creates the file)
+./build/quarry my.db          # REPL (creates the file); statements end with ';',
+                              # and a trailing one without ';' still runs at EOF
 ./build/quarry my.db -c "SELECT * FROM employees;"
 make check                    # full test suite
 ```

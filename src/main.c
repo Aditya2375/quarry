@@ -136,6 +136,26 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "error: %s\n", q_err);
         }
     }
+    /* EOF with an unterminated tail: run it like sqlite's CLI. Dropping it
+       silently would lose an INSERT or a COMMIT the user believes happened
+       (an open transaction then rolls back on close without a word). */
+    {
+        size_t lead = 0;
+        for (;;) {
+            while (lead < blen && (buf[lead] == ' ' || buf[lead] == '\t' || buf[lead] == '\n' || buf[lead] == '\r')) lead++;
+            if (lead + 1 < blen && buf[lead] == '-' && buf[lead + 1] == '-') {
+                while (lead < blen && buf[lead] != '\n') lead++;
+                continue;
+            }
+            break;
+        }
+        if (lead < blen && buf[lead] != '.') {
+            if (db_exec(d, buf + lead) != Q_OK)
+                fprintf(stderr, "error: %s\n", q_err);
+        } else if (lead < blen) {
+            fprintf(stderr, "error: dot-command at end of input needs a newline\n");
+        }
+    }
 done:
     if (db_close(d) != Q_OK) { fprintf(stderr, "error: %s\n", q_err); return 1; }
     return 0;

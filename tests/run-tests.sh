@@ -477,6 +477,34 @@ case "$out" in
   *) echo "FAIL: comment semicolon: [$out]"; fails=$((fails + 1));;
 esac
 
+# R8 D2: a trailing statement without ';' at EOF must still run (sqlite CLI
+# behavior) - a silently dropped INSERT/COMMIT loses acknowledged work
+rm -f "$T/r8d2.qry" "$T/r8d2.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1)" | "$BIN" "$T/r8d2.qry" >/dev/null 2>&1
+n=$(printf "SELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r8d2.qry" 2>/dev/null | grep -x "1")
+[ "$n" = "1" ] && echo "ok: trailing INSERT without semicolon executes" || { echo "FAIL: R8 D2 insert n=$n"; fails=$((fails + 1)); }
+rm -f "$T/r8d2b.qry" "$T/r8d2b.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);\nBEGIN;\nINSERT INTO t VALUES (1);\nCOMMIT" | "$BIN" "$T/r8d2b.qry" >/dev/null 2>&1
+n=$(printf "SELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r8d2b.qry" 2>/dev/null | grep -x "1")
+[ "$n" = "1" ] && echo "ok: trailing COMMIT without semicolon commits" || { echo "FAIL: R8 D2 commit n=$n"; fails=$((fails + 1)); }
+out=$(printf "CREATE TABLE t (id INT PRIMARY KEY);\n-- just a comment" | "$BIN" "$T/r8d2c.qry" 2>&1)
+case "$out" in *error:*) echo "FAIL: R8 D2 comment tail noisy [$out]"; fails=$((fails + 1));; *) echo "ok: comment-only tail stays silent";; esac
+rm -f "$T/r8d2c.qry" "$T/r8d2c.qry.wal"
+out=$(printf "CREATE TABLE t (id INT PRIMARY KEY);\n.tables" | "$BIN" "$T/r8d2d.qry" 2>&1)
+case "$out" in *"needs a newline"*) echo "ok: trailing dot-command errors honestly";; *) echo "FAIL: R8 D2 dot tail [$out]"; fails=$((fails + 1));; esac
+rm -f "$T/r8d2d.qry" "$T/r8d2d.qry.wal"
+
+# R8 D4: pager_open refuse-after-recovery path frees the WAL map (leak
+# caught by the sanitize job's leak checker; here we pin the behavior)
+rm -f "$T/r8d4.qry" "$T/r8d4.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);\n.checkpoint\nINSERT INTO t VALUES (1);\n.crash\n" | "$BIN" "$T/r8d4.qry" >/dev/null 2>&1 || true
+: > "$T/r8d4.qry"   # main file lost; WAL holds frames but no catalog page
+out=$(printf "SELECT 1;\n" | "$BIN" "$T/r8d4.qry" 2>&1) && rc=0 || rc=$?
+case "$out" in
+  *"without its catalog page"*) echo "ok: empty main + catalogless WAL refuses as before";;
+  *) echo "FAIL: R8 D4 [$out]"; fails=$((fails + 1));;
+esac
+
 # N2 + N6: syscall fault injection via LD_PRELOAD shim (skipped where the
 # shim cannot be built, e.g. non-Linux CI without -ldl)
 # under ASan the binary must be first in LD_PRELOAD, so the shim cannot be
@@ -484,6 +512,46 @@ esac
 if ldd "$BIN" 2>/dev/null | grep -qi 'asan'; then
   echo "skip: fault-injection shim incompatible with the ASan runtime"
 elif cc -shared -fPIC -O2 tests/shim.c -o "$T/shim.so" -ldl 2>/dev/null; then
+
+  # R8 D1: a checkpoint whose WAL header rewrite fails leaves a 0-byte WAL;
+  # the next commit must rewrite the header before staging frames, or the
+  # acknowledged commit becomes unreadable ("WAL has an unknown format")
+  rm -f "$T/r8d1.qry" "$T/r8d1.qry.wal" "$T/r8d1.mark" "$T/r8d1.fifo"
+  mkfifo "$T/r8d1.fifo"
+  QSHIM=1 QSHIM_MARKER="$T/r8d1.mark" QSHIM_FAIL_WRITE=1 \
+    LD_PRELOAD="$T/shim.so" "$BIN" "$T/r8d1.qry" < "$T/r8d1.fifo" > "$T/r8d1.out" 2> "$T/r8d1.err" &
+  shim_pid=$!
+  { printf "CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\n"; sleep 1
+    touch "$T/r8d1.mark"; printf ".checkpoint\n"; sleep 1
+    rm "$T/r8d1.mark"; printf "INSERT INTO t VALUES (2);\n.crash\n"; sleep 1; } > "$T/r8d1.fifo"
+  wait $shim_pid && rc=0 || rc=$?
+  ok=1
+  grep -q "WAL header rewrite failed after checkpoint" "$T/r8d1.err" || ok=0
+  [ "$(grep -c '1 row inserted.' "$T/r8d1.out")" -eq 2 ] || ok=0
+  printf "SELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r8d1.qry" 2>/dev/null | grep -qx "2" || ok=0
+  if [ $ok -eq 1 ]; then
+    echo "ok: commit after failed checkpoint rewrites WAL header, both rows survive .crash"
+  else
+    echo "FAIL: R8 D1 (see $T/r8d1.out and $T/r8d1.err)"; fails=$((fails + 1))
+  fi
+
+  # R8 D3: a WAL read error at open is reported as IO, not masked as
+  # corruption, and the WAL is left byte-identical
+  rm -f "$T/r8d3.qry" "$T/r8d3.qry.wal"
+  printf "CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\n.crash\n" | "$BIN" "$T/r8d3.qry" >/dev/null 2>&1 || true
+  cp "$T/r8d3.qry.wal" "$T/r8d3.wal.before"
+  out=$(QSHIM=1 QSHIM_FAIL_READ=1 LD_PRELOAD="$T/shim.so" "$BIN" "$T/r8d3.qry" -c "SELECT 1;" 2>&1) && rc=0 || rc=$?
+  if [ $rc -ne 0 ] \
+     && printf '%s' "$out" | grep -q "WAL header read failed" \
+     && ! printf '%s' "$out" | grep -qi "unknown format\|corrupt" \
+     && cmp -s "$T/r8d3.wal.before" "$T/r8d3.qry.wal"; then
+    echo "ok: WAL read error at open is IO, WAL untouched"
+  else
+    echo "FAIL: R8 D3 rc=$rc [$out]"; fails=$((fails + 1))
+  fi
+  # and it opens fine once the fault clears
+  out=$(printf "SELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r8d3.qry" 2>&1)
+  case "$out" in *"1"*) echo "ok: WAL replays after the read fault clears";; *) echo "FAIL: R8 D3 recovery [$out]"; fails=$((fails + 1));; esac
   # N2: WAL write fails AND the tail truncate fails: the commit reports an
   # honest error, no success line prints, and later statements in the same
   # session are refused instead of being silently lost

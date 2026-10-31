@@ -28,6 +28,13 @@ static int is_wal(int fd) {
     return l >= 4 && !strcmp(path + l - 4, ".wal");
 }
 
+ssize_t pread(int fd, void *buf, size_t n, off_t off) {
+    static ssize_t (*real)(int, void *, size_t, off_t);
+    if (!real) real = dlsym(RTLD_NEXT, "pread");
+    if (armed() && getenv("QSHIM_FAIL_READ") && is_wal(fd)) { errno = EIO; return -1; }
+    return real(fd, buf, n, off);
+}
+
 ssize_t write(int fd, const void *buf, size_t n) {
     static ssize_t (*real)(int, const void *, size_t);
     if (!real) real = dlsym(RTLD_NEXT, "write");

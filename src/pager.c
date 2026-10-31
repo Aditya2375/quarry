@@ -211,6 +211,7 @@ static int walmap_put(struct pager *p, uint32_t pgno, uint64_t off) {
 static int wal_recover(struct pager *p, int truncate_tail) {
     uint8_t hdr[16];
     ssize_t hr = read_full(p->wal_fd, hdr, sizeof hdr, 0);
+    if (hr < 0) return set_err(Q_ERR_IO, "WAL header read failed");
     if (hr > 0 && hr < (ssize_t)sizeof hdr)
         return set_err(Q_ERR_CORRUPT, "WAL header is torn - not truncating it away");
     if (hr > 0 && get32(hdr) != WAL_MAGIC)
@@ -232,13 +233,16 @@ static int wal_recover(struct pager *p, int truncate_tail) {
     for (;;) {
         uint8_t fh[FRAME_HDR];
         ssize_t r = read_full(p->wal_fd, fh, sizeof fh, off);
+        if (r < 0) return set_err(Q_ERR_IO, "WAL frame read failed");
         if (r != (ssize_t)sizeof fh) break;               /* torn tail */
         if (get32(fh) != FRAME_MAGIC) break;              /* corrupt frame: stop */
         uint32_t commit_pages = get32(fh + 8);
         uint32_t txn_frames = get32(fh + 12);
         uint32_t crc = get32(fh + 16);
         uint8_t page[Q_PAGE_SIZE];
-        if (read_full(p->wal_fd, page, Q_PAGE_SIZE, off + FRAME_HDR) != Q_PAGE_SIZE) break;
+        ssize_t pr = read_full(p->wal_fd, page, Q_PAGE_SIZE, off + FRAME_HDR);
+        if (pr < 0) return set_err(Q_ERR_IO, "WAL frame read failed");
+        if (pr != (ssize_t)Q_PAGE_SIZE) break;
         if (crc32_frame(fh, page) != crc) break;          /* corrupt header or payload: stop */
 
         if (commit_pages) {
@@ -251,7 +255,9 @@ static int wal_recover(struct pager *p, int truncate_tail) {
             int bad = 0;
             for (uint32_t k = 0; k < txn_frames; k++) {
                 uint8_t h2[FRAME_HDR];
-                if (read_full(p->wal_fd, h2, sizeof h2, f) != (ssize_t)sizeof h2 ||
+                ssize_t h2r = read_full(p->wal_fd, h2, sizeof h2, f);
+                if (h2r < 0) return set_err(Q_ERR_IO, "WAL frame read failed");
+                if (h2r != (ssize_t)sizeof h2 ||
                     get32(h2) != FRAME_MAGIC) { bad = 1; break; }
                 uint32_t pg2 = get32(h2 + 4);
                 if (pg2 >= commit_pages) { bad = 1; break; }  /* page past the committed size */
@@ -386,14 +392,21 @@ int pager_open(struct pager **out, const char *path) {
             p->pending_count = p->page_count;
             replayed = 1;
         }
-    } else if (sz < Q_PAGE_SIZE || read_full(p->fd, hdr, Q_PAGE_SIZE, 0) != Q_PAGE_SIZE
-               || get32(hdr + H_MAGIC) != DB_MAGIC) {
+    } else if (sz < Q_PAGE_SIZE) {
         rc = set_err(Q_ERR_CORRUPT, "not a quarry database (bad header)"); goto fail;
+    } else {
+        ssize_t rr = read_full(p->fd, hdr, Q_PAGE_SIZE, 0);
+        if (rr < 0) { rc = set_err(Q_ERR_IO, "database header read failed"); goto fail; }
+        if (rr != Q_PAGE_SIZE || get32(hdr + H_MAGIC) != DB_MAGIC) {
+            rc = set_err(Q_ERR_CORRUPT, "not a quarry database (bad header)"); goto fail;
+        }
     }
     if (!replayed) {
         p->page_count = get32(hdr + H_PAGES);
         p->pending_count = p->page_count;
-        if (wal_recover(p, 1) != Q_OK) { rc = Q_ERR_CORRUPT; goto fail; }
+        int rrc = wal_recover(p, 1);
+        if (rrc != Q_OK) { rc = rrc; goto fail; }  /* keep IO/NOMEM distinct from CORRUPT */
+
         p->pending_count = p->page_count;
     }
     /* test hook: fail the Nth walmap_put once (fault injection for the
@@ -408,6 +421,7 @@ int pager_open(struct pager **out, const char *path) {
 fail:
     if (p->fd >= 0) close(p->fd);
     if (p->wal_fd >= 0) close(p->wal_fd);
+    free(p->wm.keys); free(p->wm.offs);  /* wal_recover may have run before the failure */
     free(p->path); free(p->wal_path); free(p);
     return rc;
 }
@@ -431,7 +445,22 @@ int pager_commit(struct pager *p) {
     if (!p->in_txn) return set_err(Q_ERR_TXN, "no transaction to commit");
     if (lseek(p->wal_fd, 0, SEEK_END) < 0) return set_err(Q_ERR_IO, "WAL seek failed");
     uint64_t off = (uint64_t)lseek(p->wal_fd, 0, SEEK_CUR);
-    if (off < 16) off = 16;
+    if (off < 16) {
+        /* the WAL header is missing or torn (e.g. a checkpoint whose header
+           rewrite failed left the file truncated): rewrite it before
+           staging frames, or recovery would read garbage at offset 0 and
+           refuse the whole WAL, taking these acknowledged commits with it */
+        uint8_t wh[16] = {0};
+        put32(wh, WAL_MAGIC);
+        if (write_full(p->wal_fd, wh, sizeof wh, 0) < 0) {
+            if (ftruncate(p->wal_fd, (off_t)off) != 0) {
+                p->broken = true;
+                return set_err(Q_ERR_IO, "WAL header write failed and the partial header could not be removed - reopen the database");
+            }
+            return set_err(Q_ERR_IO, "WAL header write failed");
+        }
+        off = 16;
+    }
     uint64_t start = off;
     /* Stage every frame first. The walmap and page_count move only after
        the whole batch is written and fsynced, so a failed commit (disk
