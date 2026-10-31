@@ -28,20 +28,28 @@ fixed-size table descriptions (name, root page, column list).
 1. `pager_begin` starts a transaction. All writes go to an in-memory dirty
    set; reads check the dirty set, then the WAL map, then the data file.
 2. `pager_commit` appends every dirty page to the WAL as a frame
-   (magic, page number, committed page count on the last frame, CRC32 of
-   the payload), then fsyncs. Only then are the in-memory WAL map and the
-   page count updated and the commit reported successful. If any write or
-   the fsync fails, the partial frame tail is truncated back: the WAL
-   looks exactly as it did before the commit, and the still-open
-   transaction can be rolled back or retried.
+   (magic, page number, committed page count and transaction length on
+   the last frame, CRC32 covering the header fields and the payload),
+   then fsyncs. Only then are the in-memory WAL map and the page count
+   updated and the commit reported successful. If any write or the fsync
+   fails, the partial frame tail is truncated back: the WAL looks exactly
+   as it did before the commit, and the still-open transaction can be
+   rolled back or retried. If the in-memory map cannot absorb the commit
+   (allocation failure), it is rebuilt by rescanning the WAL; if that
+   also fails the commit reports an honest error and the WAL is left
+   untouched, so the next open still recovers the data.
 3. `pager_rollback` drops the dirty set. Nothing uncommitted ever reaches
    the file, so rollback is that simple.
 4. A checkpoint (on close, on `.checkpoint`, or automatically after 2000
    logged frames) copies the WAL-mapped pages into the data file, fsyncs,
    and truncates the WAL.
-5. On open, recovery scans the WAL: frames are validated (magic + CRC),
-   complete transactions are folded into the in-memory WAL map, and a
-   torn or corrupt tail (the crash point) is ignored. One deliberate
+5. On open, recovery scans the WAL: frames are validated (magic + CRC,
+   which also covers the page number and commit fields), and only a
+   contiguous run of frames that ends in a commit frame whose recorded
+   transaction length matches the run is folded into the in-memory WAL
+   map - so stray CRC-valid frames that were never part of a commit
+   cannot smuggle pages in, and a torn or corrupt tail (the crash point)
+   is ignored. One deliberate
    trade-off: a CRC failure stops recovery at that frame, so if a
    *completed* frame is ever damaged, later committed transactions are
    dropped too - CRCs prove where valid data ends, not where corruption
@@ -58,9 +66,11 @@ the data and WAL files are fsynced at open to keep that part durable.
 
 A failed *statement* inside an explicit transaction follows the same
 idea at a smaller scale: the executor marks a savepoint before the
-statement and restores the dirty-set length and page count on failure,
-which discards exactly that statement's pages while the transaction
-stays open.
+statement and, on failure, restores the dirty-set length and page count
+*and* replays a small undo log of before-images for pages that were
+already dirty when the statement began (truncating the dirty set alone
+cannot undo edits made in place to those pages). Exactly that
+statement's changes are discarded while the transaction stays open.
 
 ## Trade-offs (why it is small enough to verify)
 

@@ -20,8 +20,14 @@
 #include <fcntl.h>
 
 #define DB_MAGIC   0x31525551u /* "QUR1" */
-#define WAL_MAGIC  0x4C415751u /* "QWAL" */
+#define WAL_MAGIC  0x4C415752u /* "QWAL" v2: 24-byte self-describing frames */
 #define FRAME_MAGIC 0x4D415246u /* "FRAM" */
+/* frame header v2: magic, pgno, commit_pages, txn_frames, crc, reserved.
+   txn_frames is set on the commit frame only and says how many frames the
+   transaction has, so recovery folds exactly that run and never absorbs
+   frames of a dead transaction sitting between commits. crc covers the
+   pgno/commit_pages/txn_frames fields AND the page. */
+#define FRAME_HDR  24
 
 char q_err[256];
 
@@ -37,11 +43,12 @@ static void crc_init(void) {
     }
     crc_ready = true;
 }
-static uint32_t crc32_of(const void *data, size_t len) {
+/* crc over the frame's semantic header fields plus its page */
+static uint32_t crc32_frame(const uint8_t *fh, const uint8_t *page) {
     crc_init();
-    const uint8_t *b = data;
     uint32_t c = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; i++) c = crc_table[(c ^ b[i]) & 0xFF] ^ (c >> 8);
+    for (int i = 4; i < 16; i++) c = crc_table[(c ^ fh[i]) & 0xFF] ^ (c >> 8);
+    for (size_t i = 0; i < Q_PAGE_SIZE; i++) c = crc_table[(c ^ page[i]) & 0xFF] ^ (c >> 8);
     return c ^ 0xFFFFFFFFu;
 }
 
@@ -65,6 +72,10 @@ struct pager {
 
     struct walmap wm;
     size_t frames_since_ckpt;
+
+    bool     broken;         /* WAL map rebuild failed; only close is safe */
+    size_t   walmap_fail_in; /* test hook: countdown to injected map failure */
+    size_t   walmap_fail_period; /* original countdown value (repeats) */
 
     /* statement savepoint undo log: before-images of pages that were
        already dirty when the savepoint was marked. Truncating the dirty
@@ -175,6 +186,10 @@ static int walmap_grow(struct pager *p, size_t ncap) {
     return Q_OK;
 }
 static int walmap_put(struct pager *p, uint32_t pgno, uint64_t off) {
+    if (p->walmap_fail_in && --p->walmap_fail_in == 0) {
+        p->walmap_fail_in = p->walmap_fail_period; /* fail periodically */
+        return set_err(Q_ERR_NOMEM, "injected WAL map failure");
+    }
     if ((p->wm.n + 1) * 10 >= p->wm.cap * 7) {   /* keep load < 0.7 */
         if (walmap_grow(p, p->wm.cap ? p->wm.cap * 2 : 1024) != Q_OK) return Q_ERR_NOMEM;
     }
@@ -209,35 +224,41 @@ static int wal_recover(struct pager *p) {
 
     uint64_t off = 16;
     uint64_t last_commit_end = 16;
-    uint32_t pending_since_commit = 0;
-    uint64_t tx_start = 16;
     for (;;) {
-        uint8_t fh[16];
+        uint8_t fh[FRAME_HDR];
         ssize_t r = read_full(p->wal_fd, fh, sizeof fh, off);
         if (r != (ssize_t)sizeof fh) break;               /* torn tail */
         if (get32(fh) != FRAME_MAGIC) break;              /* corrupt frame: stop */
         uint32_t commit_pages = get32(fh + 8);
-        uint32_t crc = get32(fh + 12);
+        uint32_t txn_frames = get32(fh + 12);
+        uint32_t crc = get32(fh + 16);
         uint8_t page[Q_PAGE_SIZE];
-        if (read_full(p->wal_fd, page, Q_PAGE_SIZE, off + 16) != Q_PAGE_SIZE) break;
-        if (crc32_of(page, Q_PAGE_SIZE) != crc) break;    /* corrupt payload: stop */
+        if (read_full(p->wal_fd, page, Q_PAGE_SIZE, off + FRAME_HDR) != Q_PAGE_SIZE) break;
+        if (crc32_frame(fh, page) != crc) break;          /* corrupt header or payload: stop */
 
-        if (pending_since_commit == 0) tx_start = off;
-        pending_since_commit++;
         if (commit_pages) {
-            /* transaction complete: fold its frames into the WAL map */
-            uint64_t f = tx_start;
-            for (uint32_t k = 0; k < pending_since_commit; k++) {
-                uint8_t h2[16];
-                if (read_full(p->wal_fd, h2, sizeof h2, f) != (ssize_t)sizeof h2) break;
-                walmap_put(p, get32(h2 + 4), f);
-                f += 16 + Q_PAGE_SIZE;
+            /* Fold exactly this transaction's frames: the txn_frames frames
+               ending at the commit frame. Frames of a dead transaction
+               sitting between commits are never folded into a live one. */
+            uint64_t span = (uint64_t)txn_frames * (FRAME_HDR + Q_PAGE_SIZE);
+            if (txn_frames < 1 || span > off + FRAME_HDR + Q_PAGE_SIZE - 16) break;
+            uint64_t f = off - (uint64_t)(txn_frames - 1) * (FRAME_HDR + Q_PAGE_SIZE);
+            int bad = 0;
+            for (uint32_t k = 0; k < txn_frames; k++) {
+                uint8_t h2[FRAME_HDR];
+                if (read_full(p->wal_fd, h2, sizeof h2, f) != (ssize_t)sizeof h2 ||
+                    get32(h2) != FRAME_MAGIC) { bad = 1; break; }
+                uint32_t pg2 = get32(h2 + 4);
+                if (pg2 >= commit_pages) { bad = 1; break; }  /* page past the committed size */
+                if (walmap_put(p, pg2, f) != Q_OK)
+                    return set_err(Q_ERR_NOMEM, "out of memory");
+                f += FRAME_HDR + Q_PAGE_SIZE;
             }
+            if (bad) break;  /* corrupt commit run: drop it and the tail */
             p->page_count = commit_pages;
-            pending_since_commit = 0;
-            last_commit_end = off + 16 + Q_PAGE_SIZE;
+            last_commit_end = off + FRAME_HDR + Q_PAGE_SIZE;
         }
-        off += 16 + Q_PAGE_SIZE;
+        off += FRAME_HDR + Q_PAGE_SIZE;
     }
     /* Anything past the last valid commit boundary - a torn tail, garbage
        appended while the file was offline, or frames of a dead transaction
@@ -309,6 +330,13 @@ int pager_open(struct pager **out, const char *path) {
     p->pending_count = p->page_count;
     if (wal_recover(p) != Q_OK) { rc = Q_ERR_CORRUPT; goto fail; }
     p->pending_count = p->page_count;
+    /* test hook: fail the Nth walmap_put once (fault injection for the
+       commit-time map-rebuild path) */
+    const char *inj = getenv("QUARRY_WALMAP_FAIL_AFTER");
+    if (inj) {
+        p->walmap_fail_in = (size_t)strtoull(inj, NULL, 10);
+        p->walmap_fail_period = p->walmap_fail_in;
+    }
     *out = p;
     return Q_OK;
 fail:
@@ -322,6 +350,7 @@ fail:
 bool pager_in_txn(struct pager *p) { return p->in_txn; }
 
 int pager_begin(struct pager *p) {
+    if (p->broken) return set_err(Q_ERR_IO, "pager unusable after a WAL map failure - reopen the database");
     if (p->in_txn) return set_err(Q_ERR_TXN, "already inside a transaction");
     p->in_txn = true;
     p->ndirty = 0;
@@ -332,6 +361,7 @@ int pager_begin(struct pager *p) {
 }
 
 int pager_commit(struct pager *p) {
+    if (p->broken) return set_err(Q_ERR_IO, "pager unusable after a WAL map failure - reopen the database");
     if (!p->in_txn) return set_err(Q_ERR_TXN, "no transaction to commit");
     if (lseek(p->wal_fd, 0, SEEK_END) < 0) return set_err(Q_ERR_IO, "WAL seek failed");
     uint64_t off = (uint64_t)lseek(p->wal_fd, 0, SEEK_CUR);
@@ -343,19 +373,20 @@ int pager_commit(struct pager *p) {
        partial tail is truncated away and ROLLBACK still just drops the
        dirty set. */
     for (size_t i = 0; i < p->ndirty; i++) {
-        uint8_t fh[16];
+        uint8_t fh[FRAME_HDR] = {0};
         uint32_t last = (i + 1 == p->ndirty) ? p->pending_count : 0;
         put32(fh, FRAME_MAGIC);
         put32(fh + 4, p->dirty[i].pgno);
         put32(fh + 8, last);
-        put32(fh + 12, crc32_of(p->dirty[i].bytes, Q_PAGE_SIZE));
+        put32(fh + 12, last ? (uint32_t)p->ndirty : 0);  /* txn_frames on the commit frame */
+        put32(fh + 16, crc32_frame(fh, p->dirty[i].bytes));
         if (write_full(p->wal_fd, fh, sizeof fh, off) < 0 ||
-            write_full(p->wal_fd, p->dirty[i].bytes, Q_PAGE_SIZE, off + 16) < 0) {
+            write_full(p->wal_fd, p->dirty[i].bytes, Q_PAGE_SIZE, off + FRAME_HDR) < 0) {
             if (ftruncate(p->wal_fd, (off_t)start) != 0)
                 return set_err(Q_ERR_IO, "WAL write failed (partial frames may linger until the next checkpoint)");
             return set_err(Q_ERR_IO, "WAL write failed");
         }
-        off += 16 + Q_PAGE_SIZE;
+        off += FRAME_HDR + Q_PAGE_SIZE;
     }
     if (fsync(p->wal_fd) < 0) {
         if (ftruncate(p->wal_fd, (off_t)start) != 0)
@@ -365,18 +396,28 @@ int pager_commit(struct pager *p) {
     off = start;
     for (size_t i = 0; i < p->ndirty; i++) {
         if (walmap_put(p, p->dirty[i].pgno, off) != Q_OK) {
-            /* frames are durable; losing the in-memory map is not fatal:
-               end the txn and checkpoint right away, which rebuilds it */
-            p->page_count = p->pending_count;
+            /* The frames are durable; the in-memory map is partial. Never
+               checkpoint from a partial map - unmapped pages would be read
+               back from the stale main file and the WAL truncated on top,
+               destroying committed data while reporting success. Rebuild
+               the whole map from the WAL instead. If even that fails, keep
+               the WAL intact and mark the pager unusable; the next open
+               recovers everything. */
+            free(p->wm.keys); free(p->wm.offs);
+            p->wm.keys = NULL; p->wm.offs = NULL; p->wm.cap = p->wm.n = 0;
+            int rrc = wal_recover(p);
             p->ndirty = 0;
             p->in_txn = false;
             p->sp_active = false;
             p->nundo = 0;
-            int rc = pager_checkpoint(p);
-            if (rc != Q_OK) return rc;
+            if (rrc != Q_OK) {
+                p->broken = true;
+                return set_err(Q_ERR_NOMEM,
+                    "WAL map rebuild failed; committed data is safe on disk - reopen the database");
+            }
             return Q_OK;
         }
-        off += 16 + Q_PAGE_SIZE;
+        off += FRAME_HDR + Q_PAGE_SIZE;
         p->frames_since_ckpt++;
     }
     p->page_count = p->pending_count;
@@ -455,7 +496,7 @@ int pager_get(struct pager *p, uint32_t pgno, const uint8_t **page) {
     p->rnext = (p->rnext + 1) % 32;
     uint64_t woff;
     if (walmap_find(p, pgno, &woff)) {
-        if (read_full(p->wal_fd, buf, Q_PAGE_SIZE, woff + 16) != Q_PAGE_SIZE)
+        if (read_full(p->wal_fd, buf, Q_PAGE_SIZE, woff + FRAME_HDR) != Q_PAGE_SIZE)
             return set_err(Q_ERR_IO, "WAL read failed");
     } else {
         if (read_full(p->fd, buf, Q_PAGE_SIZE, (uint64_t)pgno * Q_PAGE_SIZE) != Q_PAGE_SIZE)
@@ -502,12 +543,13 @@ int pager_alloc(struct pager *p, uint32_t *pgno, uint8_t **page) {
 
 /* ---------- checkpoint / close ---------- */
 int pager_checkpoint(struct pager *p) {
+    if (p->broken) return set_err(Q_ERR_IO, "pager unusable after a WAL map failure - reopen the database");
     if (p->in_txn) return set_err(Q_ERR_TXN, "cannot checkpoint inside a transaction");
     for (size_t i = 0; i < p->wm.cap; i++) {
         if (!p->wm.keys[i]) continue;
         uint32_t pgno = p->wm.keys[i] - 1;
         uint8_t page[Q_PAGE_SIZE];
-        if (read_full(p->wal_fd, page, Q_PAGE_SIZE, p->wm.offs[i] + 16) != Q_PAGE_SIZE)
+        if (read_full(p->wal_fd, page, Q_PAGE_SIZE, p->wm.offs[i] + FRAME_HDR) != Q_PAGE_SIZE)
             return set_err(Q_ERR_IO, "WAL read during checkpoint failed");
         if (write_full(p->fd, page, Q_PAGE_SIZE, (uint64_t)pgno * Q_PAGE_SIZE) < 0)
             return set_err(Q_ERR_IO, "checkpoint write failed");
@@ -532,7 +574,9 @@ int pager_checkpoint(struct pager *p) {
 
 int pager_close(struct pager *p) {
     if (p->in_txn) pager_rollback(p);
-    int rc = pager_checkpoint(p);
+    /* a broken pager keeps its WAL for the next open; checkpointing from
+       its partial map would destroy committed data */
+    int rc = p->broken ? Q_OK : pager_checkpoint(p);
     close(p->fd);
     close(p->wal_fd);
     free(p->path); free(p->wal_path);
@@ -554,6 +598,7 @@ void pager_abandon(struct pager *p) {
 }
 
 uint32_t pager_page_count(struct pager *p) { return p->page_count; }
+uint32_t pager_pending_count(struct pager *p) { return p->pending_count; }
 
 int pager_get_catalog(struct pager *p, uint32_t *root, uint64_t *seq) {
     const uint8_t *hdr;

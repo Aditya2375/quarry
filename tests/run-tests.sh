@@ -298,6 +298,134 @@ if [ "$out" = "ID
 2
 (2 rows)" ]; then echo "ok: garbage WAL tail truncated at open"; else echo "FAIL: WAL tail: [$out]"; fails=$((fails + 1)); fi
 
+# ---- round-3 regressions ----------------------------------------------
+
+# F1a: a rolled-back CREATE TABLE must leave no in-memory trace: the same
+# name can be created again right after the rollback
+rm -f "$T/r3f1a.qry" "$T/r3f1a.qry.wal"
+out=$(printf "BEGIN;\nCREATE TABLE x (id INT PRIMARY KEY);\nROLLBACK;\nCREATE TABLE x (id INT PRIMARY KEY);\nINSERT INTO x VALUES (7);\nSELECT COUNT(*) FROM x;\n" | "$BIN" "$T/r3f1a.qry")
+case "$out" in
+  *"rollback."*"table X created."*"1 row inserted."*"1"*) echo "ok: rollback of CREATE TABLE resyncs the catalog";;
+  *) echo "FAIL: rollback CREATE: [$out]"; fails=$((fails + 1));;
+esac
+
+# F1b: rollback of a transaction that split table a's root must not leave a
+# stale root; later writes to another table must not leak into a
+rm -f "$T/r3f1b.qry" "$T/r3f1b.qry.wal"
+{
+  echo "CREATE TABLE a (id INT PRIMARY KEY, v INT);"
+  echo "INSERT INTO a VALUES (1, 1);"; echo "INSERT INTO a VALUES (2, 2);"
+  echo "CREATE TABLE b (id INT PRIMARY KEY, w INT);"
+  echo "BEGIN;"
+  i=1; while [ $i -le 200 ]; do echo "INSERT INTO a VALUES ($((i + 2)), $i);"; i=$((i + 1)); done
+  echo "ROLLBACK;"
+  i=1; while [ $i -le 399 ]; do echo "INSERT INTO b VALUES ($i, $i);"; i=$((i + 1)); done
+  echo "SELECT COUNT(*) FROM a;"
+  echo "INSERT INTO a VALUES (99999, 7);"
+  echo "SELECT COUNT(*) FROM a;"
+  echo "SELECT COUNT(*) FROM b;"
+} | "$BIN" "$T/r3f1b.qry" > "$T/r3f1b.out" 2>&1
+ca=$(sed -n 's/^count$/{n;p}' "$T/r3f1b.out" 2>/dev/null | head -1)
+out=$(awk '/^count$/{getline; print}' "$T/r3f1b.out" | tr '\n' ' ')
+if [ "$out" = "2 3 399 " ]; then echo "ok: rollback after root splits resyncs in-memory roots"; else echo "FAIL: rollback roots: [$out]"; fails=$((fails + 1)); fi
+
+# F2: pages allocated inside an open transaction are readable by later
+# statements in the same transaction (pending-count budget, not just
+# committed page_count)
+rm -f "$T/r3f2.qry" "$T/r3f2.qry.wal"
+{
+  echo "CREATE TABLE t (id INT PRIMARY KEY, v TEXT);"
+  echo "INSERT INTO t VALUES (1, 'x');"
+  echo "BEGIN;"
+  i=2; while [ $i -le 41 ]; do echo "INSERT INTO t VALUES ($i, '$(printf 'y%.0s' $(seq 1 750))');"; i=$((i + 1)); done
+  echo "SELECT COUNT(*) FROM t;"
+  echo "COMMIT;"
+} | "$BIN" "$T/r3f2.qry" > "$T/r3f2.out" 2>&1
+if grep -q "leaf sibling chain loops" "$T/r3f2.out"; then
+  echo "FAIL: in-txn page budget: sibling loop reported"; fails=$((fails + 1))
+elif awk '/^count$/{getline; print}' "$T/r3f2.out" | grep -q '^41$'; then
+  echo "ok: in-txn reads see pages allocated by the same transaction"
+else
+  echo "FAIL: in-txn page budget: [$(cat "$T/r3f2.out" | tr '\n' ' ' | tail -c 120)]"; fails=$((fails + 1))
+fi
+
+# F3: dead frames between two committed runs must not fold into the second
+# run at recovery (crafted WAL: commitA + CRC-valid dead frame + commitB)
+rm -f "$T/r3f3.qry" "$T/r3f3.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY, v INT);\n.crash\n" | "$BIN" "$T/r3f3.qry" > /dev/null 2>&1 || true
+printf "INSERT INTO t VALUES (1, 1);\n.crash\n" | "$BIN" "$T/r3f3.qry" > /dev/null 2>&1 || true
+python3 - "$T/r3f3.qry.wal" <<'EOF'
+import struct, sys, zlib
+wal = open(sys.argv[1], "rb").read()
+frames = []
+off = 16
+while off + 24 <= len(wal):
+    magic, pgno, cp, tf = struct.unpack_from("<IIII", wal, off)
+    if magic != 0x4D415246: break
+    frames.append((off, cp))
+    off += 24 + 4096
+ci = next(i for i, (_, cp) in enumerate(frames) if cp)
+a_end = frames[ci][0] + 24 + 4096
+txA, txB = wal[16:a_end], wal[a_end:]
+hdr = bytearray(24)
+struct.pack_into("<IIII", hdr, 0, 0x4D415246, 0, 0, 0)   # dead frame: page 0, no commit
+struct.pack_into("<I", hdr, 16, zlib.crc32(hdr[4:16] + bytes(4096)))
+open(sys.argv[1], "wb").write(wal[:16] + txA + bytes(hdr) + bytes(4096) + txB)
+EOF
+out=$(printf ".tables\nSELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r3f3.qry" 2>&1)
+case "$out" in
+  *"T"*"1"*) echo "ok: dead WAL frames between commits are ignored at recovery";;
+  *) echo "FAIL: dead WAL frame folded: [$out]"; fails=$((fails + 1));;
+esac
+
+# F4: the frame CRC covers the header fields, so flipping a committed
+# frame's pgno invalidates the frame and recovery stops there
+rm -f "$T/r3f4.qry" "$T/r3f4.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY, v INT);\nINSERT INTO t VALUES (1, 1);\n.crash\n" | "$BIN" "$T/r3f4.qry" > /dev/null 2>&1 || true
+python3 - "$T/r3f4.qry.wal" <<'EOF'
+import struct, sys
+p = sys.argv[1]
+wal = bytearray(open(p, "rb").read())
+off = 16; last = -1
+while off + 24 <= len(wal):
+    magic, pgno, cp = struct.unpack_from("<III", wal, off)
+    if magic != 0x4D415246: break
+    last = off
+    off += 24 + 4096
+struct.pack_into("<I", wal, last + 4, (struct.unpack_from("<I", wal, last + 4)[0] + 1) & 0xFFFFFFFF)
+open(p, "wb").write(bytes(wal))
+EOF
+out=$(printf ".tables\n" | "$BIN" "$T/r3f4.qry" 2>&1)
+if [ "$out" = "T" ]; then echo "ok: header fields are CRC-covered (flipped pgno rejected)"; else echo "FAIL: pgno flip accepted: [$out]"; fails=$((fails + 1)); fi
+
+# F5: a walmap failure during commit must not lose committed data
+rm -f "$T/r3f5.qry" "$T/r3f5.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY, v INT);\nINSERT INTO t VALUES (1, 1);\n" | "$BIN" "$T/r3f5.qry" > /dev/null
+# transient failure: commit retries via WAL rebuild and succeeds
+out=$(QUARRY_WALMAP_FAIL_AFTER=1000000 sh -c "printf 'INSERT INTO t VALUES (2, 2);\n' | '$BIN' '$T/r3f5.qry'" 2>&1)
+case "$out" in
+  *"1 row inserted."*) : ;;
+  *) echo "FAIL: transient walmap failure: [$out]"; fails=$((fails + 1));;
+esac
+out=$("$BIN" "$T/r3f5.qry" -c "SELECT COUNT(*) FROM t;")
+case "$out" in
+  *"2"*) echo "ok: transient walmap failure rebuilt from WAL, data durable";;
+  *) echo "FAIL: transient walmap durability: [$out]"; fails=$((fails + 1));;
+esac
+# persistent failure: honest error, no false success, WAL left alone
+out=$(QUARRY_WALMAP_FAIL_AFTER=1 sh -c "printf 'INSERT INTO t VALUES (3, 3);\n' | '$BIN' '$T/r3f5.qry'" 2>&1)
+case "$out" in
+  *"1 row inserted."*) echo "FAIL: persistent walmap failure printed success: [$out]"; fails=$((fails + 1));;
+  *"WAL map rebuild failed"*) : ;;
+  *) echo "FAIL: persistent walmap failure not reported: [$out]"; fails=$((fails + 1));;
+esac
+out=$("$BIN" "$T/r3f5.qry" -c "SELECT id FROM t ORDER BY id;")
+if [ "$out" = "ID
+1
+2
+3
+(3 rows)" ]; then echo "ok: persistent walmap failure leaves WAL intact, reopen recovers"; else echo "FAIL: persistent walmap recovery: [$out]"; fails=$((fails + 1)); fi
+
 # fuzzing: garbage SQL + on-disk corruption (shipped harness, see README)
 python3 tests/fuzz.py || fails=$((fails + 1))
 

@@ -111,7 +111,51 @@ def run_seed(seed, nops):
         return f"seed {seed}: length mismatch quarry={len(got)} sqlite={len(want)}"
     return None
 
+def run_txn_scenario():
+    """Rollback must resync the in-memory catalog: a rolled-back CREATE
+    TABLE and roots reverted by ROLLBACK (here via 200 in-txn inserts that
+    force leaf/root splits) must not leak into later writes."""
+    script = ["CREATE TABLE a (id INT PRIMARY KEY, v INT);",
+              "INSERT INTO a VALUES (1, 1);", "INSERT INTO a VALUES (2, 2);",
+              "BEGIN;"]
+    script += [f"INSERT INTO a VALUES ({i + 3}, {i});" for i in range(200)]
+    script += ["ROLLBACK;",
+               "CREATE TABLE b (id INT PRIMARY KEY, w INT);"]
+    script += [f"INSERT INTO b VALUES ({i}, {i});" for i in range(1, 400)]
+    script += ["BEGIN;", "CREATE TABLE x (id INT PRIMARY KEY);",
+               "INSERT INTO x VALUES (5);", "ROLLBACK;",
+               "CREATE TABLE x (id INT PRIMARY KEY);",
+               "INSERT INTO x VALUES (7);", "INSERT INTO x VALUES (8);"]
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "txn.qry")
+        p = subprocess.run([BIN, db], input="\n".join(script) + "\n",
+                           text=True, capture_output=True)
+        if p.returncode != 0:
+            return f"txn scenario: quarry exited {p.returncode}: {p.stderr.strip()[:200]}"
+        ref = sqlite3.connect(":memory:")
+        ref.isolation_level = None
+        for line in script:
+            ref.execute(line.rstrip(";"))
+        for t in ("a", "b", "x"):
+            q = subprocess.run([BIN, db, "-c", f"SELECT * FROM {t} ORDER BY id;"],
+                               text=True, capture_output=True)
+            got = []
+            for ln in q.stdout.splitlines()[1:]:
+                if ln.startswith("("):
+                    break
+                got.append(tuple(x.strip() for x in ln.split("|")))
+            want = [tuple(str(c) for c in r)
+                    for r in ref.execute(f"SELECT * FROM {t} ORDER BY id")]
+            if got != want:
+                return (f"txn scenario: table {t} mismatch "
+                        f"quarry={got[:3]}({len(got)}) sqlite={want[:3]}({len(want)})")
+    return None
+
 fails = 0
+err = run_txn_scenario()
+if err:
+    print(err)
+    fails += 1
 for seed in range(1, 9):
     err = run_seed(seed, 600)
     if err:

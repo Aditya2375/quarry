@@ -20,6 +20,11 @@ static void default_out(const char *fmt, ...) {
 }
 void (*q_out)(const char *fmt, ...) = default_out;
 
+/* Success lines for mutating statements are staged here and printed only
+   after the enclosing auto-commit succeeds, so a commit failure never
+   follows a printed "ok". */
+static char pending_ok[256];
+
 #define MAX_TABLES 64
 #define MAX_ROWS_COLLECT 100000
 
@@ -234,7 +239,7 @@ static int exec_create(struct db *d, struct stmt *st) {
     if (rc != Q_OK) return rc;
     if ((rc = pager_set_catalog(d->pg, catroot, seq + 1)) != Q_OK) return rc;
     if ((rc = load_catalog(d)) != Q_OK) return rc;
-    q_out("table %s created.\n", t.name);
+    snprintf(pending_ok, sizeof pending_ok, "table %s created.\n", t.name);
     return Q_OK;
 }
 
@@ -287,8 +292,7 @@ static int exec_insert(struct db *d, struct stmt *st) {
         return rc;
     }
     if (t->root != old_root && (rc = save_table(d, t)) != Q_OK) { t->root = old_root; return rc; }
-    q_out("1 row inserted.\n");
-    return Q_OK;
+    return Q_OK;   /* the caller prints success only after the commit lands */
 }
 
 struct rowvec { int64_t *keys; uint8_t **rows; uint32_t *lens; size_t n, cap; };
@@ -484,7 +488,7 @@ static int exec_update(struct db *d, struct stmt *st) {
         if (t->root != old_root && (rc = save_table(d, t)) != Q_OK) break;
     }
     if (rc != Q_OK) { t->root = root0; rowvec_free(&rv); return rc; }
-    q_out("%zu row%s updated.\n", rv.n, rv.n == 1 ? "" : "s");
+    snprintf(pending_ok, sizeof pending_ok, "%zu row%s updated.\n", rv.n, rv.n == 1 ? "" : "s");
     rowvec_free(&rv);
     return Q_OK;
 }
@@ -499,7 +503,7 @@ static int exec_delete(struct db *d, struct stmt *st) {
         if ((rc = btree_delete(d->pg, t->root, rv.keys[r])) != Q_OK) break;
     }
     if (rc != Q_OK) { rowvec_free(&rv); return rc; }
-    q_out("%zu row%s deleted.\n", rv.n, rv.n == 1 ? "" : "s");
+    snprintf(pending_ok, sizeof pending_ok, "%zu row%s deleted.\n", rv.n, rv.n == 1 ? "" : "s");
     rowvec_free(&rv);
     return Q_OK;
 }
@@ -510,6 +514,7 @@ static bool needs_txn(int kind) {
 }
 
 int db_exec(struct db *d, const char *sql) {
+    pending_ok[0] = 0; /* stage fresh success line per statement */
     struct stmt st;
     int rc = sql_parse(sql, &st);
     if (rc != Q_OK) return rc;
@@ -535,6 +540,9 @@ int db_exec(struct db *d, const char *sql) {
         if (!d->explicit_txn) return fail(Q_ERR_TXN, "no transaction to roll back");
         if ((rc = pager_rollback(d->pg)) != Q_OK) return rc;
         d->explicit_txn = false;
+        /* the rollback reverted pages, so in-memory table roots and the
+           table list are stale: resync from the catalog on disk */
+        if ((rc = load_catalog(d)) != Q_OK) return rc;
         q_out("rollback.\n");
         return Q_OK;
     }
@@ -561,9 +569,15 @@ int db_exec(struct db *d, const char *sql) {
         case S_DELETE: rc = exec_delete(d, &st); break;
         default: rc = Q_ERR_SYNTAX; break;
     }
+    int kind = st.kind;
     stmt_free(&st);
     if (own_txn) {
-        if (rc != Q_OK) pager_rollback(d->pg);
+        if (rc != Q_OK) {
+            pager_rollback(d->pg);
+            /* pages reverted; resync in-memory roots with the catalog */
+            int crc2 = load_catalog(d);
+            if (crc2 != Q_OK) rc = crc2;
+        }
         else rc = pager_commit(d->pg);
     } else if (have_sp && rc != Q_OK) {
         pager_sp_restore(d->pg, &sp);
@@ -573,6 +587,8 @@ int db_exec(struct db *d, const char *sql) {
         int crc = load_catalog(d);
         if (crc != Q_OK) rc = crc;
     }
+    if (rc == Q_OK && kind == S_INSERT) snprintf(pending_ok, sizeof pending_ok, "1 row inserted.\n");
+    if (rc == Q_OK && pending_ok[0]) { q_out("%s", pending_ok); pending_ok[0] = 0; }
     return rc;
 }
 

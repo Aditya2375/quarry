@@ -74,6 +74,7 @@ int  pager_get_mut(struct pager *p, uint32_t pgno, uint8_t **page);
 int  pager_alloc(struct pager *p, uint32_t *pgno, uint8_t **page);
 int  pager_checkpoint(struct pager *p);
 uint32_t pager_page_count(struct pager *p);
+uint32_t pager_pending_count(struct pager *p);
 int  pager_get_catalog(struct pager *p, uint32_t *root, uint64_t *seq);
 int  pager_set_catalog(struct pager *p, uint32_t root, uint64_t seq);
 

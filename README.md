@@ -31,7 +31,8 @@ make check                    # full test suite
 
 - **Crash-safe transactions.** Every commit appends the transaction's pages
   to the WAL and fsyncs before reporting success. Committed data survives a
-  kill at any point (`.crash` is a built-in power-loss hook); uncommitted
+  kill at any point (`.crash` simulates an OS or process crash by exiting
+  without checkpointing); uncommitted
   changes are never visible after recovery. `BEGIN` / `COMMIT` / `ROLLBACK`
   work, and statements outside an explicit transaction are auto-committed.
 - **B+tree storage.** 4 KB pages, signed int64 keys, ordered scans via leaf

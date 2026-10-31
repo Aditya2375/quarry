@@ -461,7 +461,9 @@ int btree_delete(struct pager *p, uint32_t root, int64_t key) {
 /* ---------- ordered scan ---------- */
 int cursor_first(struct pager *p, uint32_t root, struct cursor *c) {
     c->p = p; c->done = 0; c->idx = 0;
-    c->steps = 0; c->limit = pager_page_count(p) + 1;
+    /* pending, not committed: in-transaction scans may traverse pages
+       allocated earlier in the same transaction */
+    c->steps = 0; c->limit = pager_pending_count(p) + 1;
     uint32_t pgno = root;
     for (int depth = 0; depth < MAX_DEPTH; depth++) {
         const uint8_t *pg;
