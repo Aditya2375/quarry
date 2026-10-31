@@ -118,9 +118,12 @@ def fuzz_disk(rng, tmp):
         for f in (db, db + ".wal"):
             if os.path.exists(f):
                 os.unlink(f)
+        # most rounds stay small (single leaf); the rest grow past several
+        # levels of interior pages so corruption can hit interior cells
+        nrows = rng.randint(1, 120) if rng.random() < 0.6 else rng.randint(121, 1500)
         seed = "CREATE TABLE t (id INT PRIMARY KEY, v TEXT);\n" + "".join(
             "INSERT INTO t VALUES (%d, 'r%d');\n" % (k, k)
-            for k in range(rng.randint(1, 120)))
+            for k in range(nrows))
         r = subprocess.run([BIN, db], input=seed, text=True,
                            errors="replace", capture_output=True)
         assert r.returncode == 0, r.stderr
@@ -140,7 +143,15 @@ def fuzz_disk(rng, tmp):
             with open(db, "r+b") as f:
                 f.seek(4096 * rng.randrange(size // 4096))
                 f.write(bytes(rng.randrange(256) for _ in range(4096)))
-        check(run(db, "SELECT COUNT(*) FROM t;\n.tables\n"), "disk round %d" % i)
+        # probe reads AND writes: a cyclic or mis-linked interior page must
+        # be a clean corruption error on INSERT/UPDATE/DELETE too, never a
+        # crash or a hang
+        check(run(db, "SELECT COUNT(*) FROM t;\n.tables\n"
+                      "INSERT INTO t VALUES (2000001, 'probe');\n"
+                      "UPDATE t SET v='probe' WHERE id=3;\n"
+                      "DELETE FROM t WHERE id=4;\n"
+                      "INSERT INTO t VALUES (2000002, 'probe2');\n"
+                      "SELECT COUNT(*) FROM t;\n"), "disk round %d" % i)
     print("ok: fuzz: %d rounds of on-disk corruption, no crash or hang" % DISK_ROUNDS)
 
 

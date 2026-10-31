@@ -241,7 +241,12 @@ int btree_max(struct pager *p, uint32_t root, int64_t *key_out) {
 struct promo { int valid; int64_t key; uint32_t child; };
 
 static int insert_rec(struct pager *p, uint32_t pgno, int64_t key,
-                      const uint8_t *data, uint32_t len, struct promo *pr) {
+                      const uint8_t *data, uint32_t len, struct promo *pr,
+                      int depth) {
+    /* find_leaf/btree_max/cursor_first bound their descent at MAX_DEPTH;
+       this recursion must too, or a cyclic interior page is a stack
+       overflow instead of a corruption error */
+    if (depth >= MAX_DEPTH) return corrupt("tree deeper than 64 levels");
     uint8_t *pg;
     int rc = get_mut_checked(p, pgno, &pg);
     if (rc != Q_OK) return rc;
@@ -350,8 +355,9 @@ static int insert_rec(struct pager *p, uint32_t pgno, int64_t key,
     /* interior: descend, then absorb a promotion if the child split.
        The recursion can realloc the dirty array, so re-fetch our page. */
     uint32_t child = int_child_for(pg, key);
+    if (child == pgno) return corrupt("interior page points at itself");
     struct promo sub;
-    rc = insert_rec(p, child, key, data, len, &sub);
+    rc = insert_rec(p, child, key, data, len, &sub, depth + 1);
     if (rc != Q_OK || !sub.valid) return rc;
     rc = pager_get_mut(p, pgno, &pg);
     if (rc != Q_OK) return rc;
@@ -422,7 +428,7 @@ static int insert_rec(struct pager *p, uint32_t pgno, int64_t key,
 int btree_insert(struct pager *p, uint32_t *root_io, int64_t key,
                  const uint8_t *data, uint32_t len) {
     struct promo pr;
-    int rc = insert_rec(p, *root_io, key, data, len, &pr);
+    int rc = insert_rec(p, *root_io, key, data, len, &pr, 0);
     if (rc != Q_OK) return rc;
     if (pr.valid) {
         uint32_t nr; uint8_t *npg;

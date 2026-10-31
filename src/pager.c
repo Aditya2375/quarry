@@ -437,6 +437,23 @@ int pager_open(struct pager **out, const char *path) {
     }
     /* test hook: fail the Nth walmap_put once (fault injection for the
        commit-time map-rebuild path) */
+    /* validate the page-0 pointers against the recovered page count, or a
+       zeroed/torn header silently empties the schema: the catalog root is
+       0 exactly when the database has never allocated past page 0 */
+    {
+        const uint8_t *h0;
+        rc = pager_get(p, 0, &h0);
+        if (rc != Q_OK) goto fail;
+        uint32_t cr = get32(h0 + H_CATROOT);
+        /* catroot == 0 with pages already allocated is NOT rejected here:
+           the pager layer legitimately hosts catalog-less btrees (unit
+           tests, raw embedders); the db layer owns that invariant */
+        if (p->page_count == 0 || cr >= p->page_count) {
+            rc = set_err(Q_ERR_CORRUPT,
+                "database header is corrupt (catalog root out of range)");
+            goto fail;
+        }
+    }
     const char *inj = getenv("QUARRY_WALMAP_FAIL_AFTER");
     if (inj) {
         p->walmap_fail_in = (size_t)strtoull(inj, NULL, 10);

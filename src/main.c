@@ -48,8 +48,12 @@ int main(int argc, char **argv) {
     const char *path = "quarry.db";
     const char *one = NULL;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-c") && i + 1 < argc) one = argv[++i];
+        if (!strcmp(argv[i], "-c")) {
+            if (i + 1 >= argc) { usage(stderr); return 2; }
+            one = argv[++i];
+        }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout); return 0; }
+        else if (argv[i][0] == '-') { usage(stderr); return 2; }  /* never create a file named "-c" */
         else path = argv[i];
     }
 

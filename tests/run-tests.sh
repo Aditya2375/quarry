@@ -232,6 +232,93 @@ print("ok: non-empty leaf sibling cycle errors instead of hanging")
 PY
 [ $? -eq 0 ] || fails=$((fails + 1))
 
+# R10: a cyclic interior page must be a clean corruption error on writes,
+# not a stack overflow - insert_rec now has the same MAX_DEPTH bound and
+# self-pointer check find_leaf always had
+rm -f "$T/r10cyc.qry" "$T/r10cyc.qry.wal"
+python3 - "$BIN" "$T/r10cyc.qry" <<'PY'
+import os, struct, subprocess, sys
+bin_, db = sys.argv[1], sys.argv[2]
+seed = ["CREATE TABLE t (id INT PRIMARY KEY, v TEXT);"] + \
+       ["INSERT INTO t VALUES (%d, 'r%d');" % (i, i) for i in range(1000)]
+r = subprocess.run([bin_, db], input="\n".join(seed) + "\n",
+                   text=True, capture_output=True)
+assert r.returncode == 0, r.stderr
+size = os.path.getsize(db)
+d = open(db, "r+b")
+found = False
+for pg in range(size // 4096):
+    d.seek(pg * 4096)
+    if d.read(1) == b"\x02":        # PT_INTERIOR
+        d.seek(pg * 4096 + 7)        # PH_LINK: rightmost child pointer
+        d.write(struct.pack("<I", pg))
+        found = True
+        break
+d.close()
+assert found, "no interior page in a 1000-row tree"
+PY
+out=$(printf "INSERT INTO t VALUES (999999, 'boom');\nUPDATE t SET v='y' WHERE id=999998;
+" | "$BIN" "$T/r10cyc.qry" 2>&1) && rc=0 || rc=$?
+if [ "$rc" != "139" ] && [ "$rc" != "134" ] && printf '%s\n' "$out" | grep -q "interior page points at itself"; then
+  echo "ok: cyclic interior page refused on INSERT/UPDATE, no crash"
+else
+  echo "FAIL: R10 cyclic interior (rc=$rc) [$out]"; fails=$((fails + 1))
+fi
+
+# R10-LOW1: a zeroed or out-of-range catalog root is silent schema loss -
+# refuse to open instead of reporting "no table named T" for everything
+rm -f "$T/r10hdr.qry" "$T/r10hdr.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);
+INSERT INTO t VALUES (1);
+" | "$BIN" "$T/r10hdr.qry" >/dev/null
+python3 - "$T/r10hdr.qry" <<'PY'
+import sys
+d = open(sys.argv[1], "r+b"); d.seek(8); d.write(bytes(4)); d.close()  # H_CATROOT = 0
+PY
+out=$(printf "SELECT * FROM t;
+" | "$BIN" "$T/r10hdr.qry" 2>&1) && rc=0 || rc=$?
+if [ "$rc" = "1" ] && printf '%s
+' "$out" | grep -q "catalog root missing"; then
+  echo "ok: zeroed catalog root refused at open"
+else
+  echo "FAIL: R10-LOW1 zeroed catroot (rc=$rc) [$out]"; fails=$((fails + 1))
+fi
+rm -f "$T/r10hdr2.qry" "$T/r10hdr2.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);
+INSERT INTO t VALUES (1);
+" | "$BIN" "$T/r10hdr2.qry" >/dev/null
+python3 - "$T/r10hdr2.qry" <<'PY'
+import struct, sys
+d = open(sys.argv[1], "r+b"); d.seek(8); d.write(struct.pack("<I", 0x00FFFFFF)); d.close()
+PY
+out=$(printf "SELECT * FROM t;
+" | "$BIN" "$T/r10hdr2.qry" 2>&1) && rc=0 || rc=$?
+if [ "$rc" = "1" ] && printf '%s
+' "$out" | grep -q "catalog root out of range"; then
+  echo "ok: out-of-range catalog root refused at open"
+else
+  echo "FAIL: R10-LOW1 wild catroot (rc=$rc) [$out]"; fails=$((fails + 1))
+fi
+
+# R10-LOW2: "-c" with no SQL, or any unknown flag, is a usage error and
+# must not create a database file named after the flag
+mkdir -p "$T/r10flags"
+( cd "$T/r10flags" && rm -f -- -c -c.wal my.db my.db.wal )
+out=$(cd "$T/r10flags" && "$OLDPWD/$BIN" my.db -c 2>&1) && rc=0 || rc=$?
+if [ "$rc" != "0" ] && printf '%s
+' "$out" | grep -q "^usage:" && [ ! -e "$T/r10flags/-c" ] && [ ! -e "$T/r10flags/-c.wal" ] && [ ! -e "$T/r10flags/my.db" ]; then
+  echo "ok: -c without SQL is a usage error, no files created"
+else
+  echo "FAIL: R10-LOW2 -c (rc=$rc) [$out]"; fails=$((fails + 1))
+fi
+out=$(cd "$T/r10flags" && "$OLDPWD/$BIN" my.db --bogus 2>&1) && rc=0 || rc=$?
+if [ "$rc" != "0" ] && printf '%s
+' "$out" | grep -q "^usage:" && [ ! -e "$T/r10flags/--bogus" ] && [ ! -e "$T/r10flags/my.db" ]; then
+  echo "ok: unknown flag is a usage error, no files created"
+else
+  echo "FAIL: R10-LOW2 unknown flag (rc=$rc) [$out]"; fails=$((fails + 1))
+fi
+
 # round-2 H3b regressions: PH_USED must match the packed cells, leaf key
 # order is enforced, and row field tags must match column types
 python3 - "$T" <<'PY'

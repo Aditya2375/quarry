@@ -149,6 +149,16 @@ int db_open(struct db **out, const char *path) {
     if (!d) return fail(Q_ERR_NOMEM, "out of memory");
     int rc = pager_open(&d->pg, path);
     if (rc != Q_OK) { free(d); return rc; }
+    /* a SQL database with allocated pages always has a catalog tree: a
+       zeroed catalog root on a multi-page file is silent schema loss */
+    {
+        uint32_t catroot; uint64_t seq;
+        if ((rc = pager_get_catalog(d->pg, &catroot, &seq)) != Q_OK) { pager_close(d->pg); free(d); return rc; }
+        if (catroot == 0 && pager_page_count(d->pg) > 1) {
+            pager_close(d->pg); free(d);
+            return fail(Q_ERR_CORRUPT, "database header is corrupt (catalog root missing)");
+        }
+    }
     if ((rc = load_catalog(d)) != Q_OK) { pager_close(d->pg); free(d); return rc; }
     *out = d;
     return Q_OK;
