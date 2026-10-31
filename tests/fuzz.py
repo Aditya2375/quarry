@@ -8,6 +8,7 @@ code is a bug.
 Rounds are tunable for CI vs. local runs:
   QUARRY_FUZZ_SQL   garbage-SQL rounds   (default 300)
   QUARRY_FUZZ_DISK  corruption rounds    (default 200)
+  QUARRY_FUZZ_WAL   WAL-mutation rounds  (default 150)
   QUARRY_FUZZ_SEED  base seed            (default 1234)
 """
 import os
@@ -19,6 +20,7 @@ import sys
 BIN = "build/quarry"
 SQL_ROUNDS = int(os.environ.get("QUARRY_FUZZ_SQL", "300"))
 DISK_ROUNDS = int(os.environ.get("QUARRY_FUZZ_DISK", "200"))
+WAL_ROUNDS = int(os.environ.get("QUARRY_FUZZ_WAL", "150"))
 TIMEOUT = 10
 
 # sanitizer stacks do not change the exit code reliably, so scan output
@@ -142,6 +144,67 @@ def fuzz_disk(rng, tmp):
     print("ok: fuzz: %d rounds of on-disk corruption, no crash or hang" % DISK_ROUNDS)
 
 
+def fuzz_wal(rng, tmp):
+    """Mutate a populated WAL (bit flips, scribbles, truncations, header
+    tears, frame surgery). Invariants every round: no crash, no sanitizer
+    output, a refusal names the WAL problem, and a successful open shows
+    exactly the checkpointed rows or exactly all rows - a silent partial
+    set means acknowledged commits vanished."""
+    base = os.path.join(tmp, "walbase.qry")
+    r = subprocess.run([BIN, base], input=
+        "CREATE TABLE kv (k INT PRIMARY KEY, v TEXT);\n"
+        + "".join("INSERT INTO kv VALUES (%d, 'a');" % i for i in range(50))
+        + ".checkpoint\n", text=True, capture_output=True)
+    assert r.returncode == 0, r.stderr
+    r = subprocess.run([BIN, base], input="BEGIN;\n"
+        + "".join("INSERT INTO kv VALUES (%d, 'b');" % i for i in range(50, 100))
+        + "COMMIT;\n.crash\n", text=True, capture_output=True)
+    assert os.path.getsize(base + ".wal") > 16, "WAL not populated"
+
+    def mutate(w):
+        kind = rng.randrange(6)
+        if kind == 0:    # bit flip at a random offset
+            i = rng.randrange(len(w)); w[i] ^= 1 << rng.randrange(8)
+        elif kind == 1:  # scribble a random run
+            i = rng.randrange(len(w)); n = rng.randrange(1, min(64, len(w) - i) + 1)
+            w[i:i+n] = bytes(rng.randrange(256) for _ in range(n))
+        elif kind == 2:  # truncate to a random length
+            del w[rng.randrange(len(w) + 1):]
+        elif kind == 3:  # tear the header to 1-15 bytes
+            del w[rng.randrange(1, 16):]
+        elif kind == 4:  # garbage over the header
+            w[:16] = bytes(rng.randrange(256) for _ in range(16))
+        elif len(w) > 16:  # scribble inside one frame
+            i = rng.randrange(16, len(w)); n = rng.randrange(1, min(32, len(w) - i) + 1)
+            w[i:i+n] = bytes(rng.randrange(256) for _ in range(n))
+
+    for i in range(WAL_ROUNDS):
+        db = os.path.join(tmp, "walmut.qry")
+        for f in (db, db + ".wal"):
+            if os.path.exists(f):
+                os.unlink(f)
+        import shutil
+        shutil.copyfile(base, db)
+        wal = bytearray(open(base + ".wal", "rb").read())
+        mutate(wal)
+        open(db + ".wal", "wb").write(wal)
+        r = run(db, "SELECT k FROM kv;\n")
+        check(r, "wal round %d" % i)
+        if r.returncode == 1:
+            blob = (r.stderr or "") + (r.stdout or "")
+            assert ".wal file" in blob or "WAL" in blob, \
+                "wal round %d: refusal without WAL context: %r" % (i, blob[:200])
+            continue
+        rows = set()
+        for line in (r.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                rows.add(int(line))
+        assert rows == set(range(50)) or rows == set(range(100)), \
+            "wal round %d: silent partial set (%d rows)" % (i, len(rows))
+    print("ok: fuzz: %d rounds of WAL mutation, invariants held" % WAL_ROUNDS)
+
+
 def main():
     base = int(os.environ.get("QUARRY_FUZZ_SEED", "1234"))
     tmp = "/tmp/quarry-fuzz"
@@ -152,6 +215,7 @@ def main():
     # new paths instead of replaying one stream prefix
     fuzz_sql(random.Random(base), tmp)
     fuzz_disk(random.Random(base ^ 0x5EED), tmp)
+    fuzz_wal(random.Random(base ^ 0x9A11), tmp)
 
 
 if __name__ == "__main__":

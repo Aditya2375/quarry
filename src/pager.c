@@ -212,15 +212,16 @@ static int wal_recover(struct pager *p, int truncate_tail) {
     uint8_t hdr[16];
     ssize_t hr = read_full(p->wal_fd, hdr, sizeof hdr, 0);
     if (hr < 0) return set_err(Q_ERR_IO, "WAL header read failed");
-    if (hr > 0 && hr < (ssize_t)sizeof hdr)
-        return set_err(Q_ERR_CORRUPT, "WAL header is torn - not truncating it away");
-    if (hr > 0 && get32(hdr) != WAL_MAGIC)
-        /* a non-empty WAL we do not recognize may hold committed data
-           (older format, torn header). Never erase it: fail the open. */
-        return set_err(Q_ERR_CORRUPT, "WAL has an unknown format - not truncating it away");
+    if (hr == (ssize_t)sizeof hdr && get32(hdr) != WAL_MAGIC)
+        /* a full-size WAL we do not recognize may hold committed data
+           (older format, garbage appended by another tool). Never erase
+           it: fail the open. */
+        return set_err(Q_ERR_CORRUPT, "WAL has an unknown format - not truncating it away; restore a backup or remove the .wal file to start over");
     if (hr < (ssize_t)sizeof hdr) {
-        /* a truly empty WAL is initialized; a short one already failed
-           above with a corrupt error */
+        /* 0-15 bytes: frames start at offset 16 and each is thousands of
+           bytes, so this WAL provably holds no frame - not even a torn
+           one. Reinitialize it instead of bricking the database over a
+           torn header. */
         uint8_t wh[16] = {0};
         put32(wh, WAL_MAGIC);
         if (write_full(p->wal_fd, wh, sizeof wh, 0) < 0)
@@ -281,16 +282,18 @@ static int wal_recover(struct pager *p, int truncate_tail) {
     return Q_OK;
 }
 
-static void fsync_dir(const char *path) {
+static int fsync_dir(const char *path) {
     /* make a newly created file's directory entry durable */
     char *dup = strdup(path);
-    if (!dup) return;
+    if (!dup) return -1;
     char *slash = strrchr(dup, '/');
     if (slash) { *slash = 0; if (!dup[0]) strcpy(dup, "/"); }
     else strcpy(dup, ".");
     int dfd = open(dup, O_RDONLY);
-    if (dfd >= 0) { fsync(dfd); close(dfd); }
+    int rc = -1;
+    if (dfd >= 0) { rc = fsync(dfd); close(dfd); }
     free(dup);
+    return rc;
 }
 
 int pager_open(struct pager **out, const char *path) {
@@ -305,6 +308,7 @@ int pager_open(struct pager **out, const char *path) {
     memcpy(p->wal_path, path, n);
     memcpy(p->wal_path + n, ".wal", 5);
 
+    int existed = access(path, F_OK) == 0, wal_existed = access(p->wal_path, F_OK) == 0;
     p->fd = open(path, O_RDWR | O_CREAT, 0644);
     if (p->fd < 0) { rc = set_err(Q_ERR_IO, "cannot open database file"); goto fail; }
     p->wal_fd = open(p->wal_path, O_RDWR | O_CREAT, 0644);
@@ -326,21 +330,37 @@ int pager_open(struct pager **out, const char *path) {
         goto fail;
     }
 #endif
-    fsync_dir(path);
+    /* a brand-new file's directory entry needs its own fsync, or a crash
+       can lose the database even after every commit fsynced. Only the
+       create case is fatal: for a pre-existing file the entry is already
+       as durable as it was before we arrived. */
+    if (fsync_dir(path) != 0 && !existed) {
+        rc = set_err(Q_ERR_IO, "cannot sync directory for new database file"); goto fail;
+    }
+    if (fsync_dir(p->wal_path) != 0 && !wal_existed) {
+        rc = set_err(Q_ERR_IO, "cannot sync directory for new WAL file"); goto fail;
+    }
 
     uint8_t hdr[Q_PAGE_SIZE] = {0};
     off_t sz = lseek(p->fd, 0, SEEK_END);
+    if (sz < 0) { rc = set_err(Q_ERR_IO, "cannot seek database file"); goto fail; }
     int replayed = 0;
-    if (sz == 0) {
+    if (sz < Q_PAGE_SIZE) {
+        /* an empty OR partial main file: both are missing every page, so
+           both attempt WAL replay exactly the same way */
         off_t wsz = lseek(p->wal_fd, 0, SEEK_END);
+        if (wsz < 0) { rc = set_err(Q_ERR_IO, "cannot seek WAL file"); goto fail; }
         uint8_t whdr[16] = {0};
         ssize_t hr = wsz == 16 ? read_full(p->wal_fd, whdr, sizeof whdr, 0) : 0;
-        if (wsz == 0 || (hr == (ssize_t)sizeof whdr && get32(whdr) == WAL_MAGIC)) {
+        if (wsz < 16 || (hr == (ssize_t)sizeof whdr && get32(whdr) == WAL_MAGIC)) {
             /* fresh or cleanly checkpointed WAL: no frames to lose */
             put32(hdr + H_MAGIC, DB_MAGIC);
             put32(hdr + H_PAGES, 1);
             put32(hdr + H_CATROOT, 0);
             put64le(hdr + H_CATSEQ, 1);
+            if (ftruncate(p->fd, 0) != 0) {  /* drop a partial-main tail */
+                rc = set_err(Q_ERR_IO, "cannot reset partial database file"); goto fail;
+            }
             if (write_full(p->fd, hdr, Q_PAGE_SIZE, 0) < 0) {
                 rc = set_err(Q_ERR_IO, "cannot initialize database file"); goto fail;
             }
@@ -373,10 +393,18 @@ int pager_open(struct pager **out, const char *path) {
                     "database file is empty and the WAL holds no recoverable committed data - refusing to destroy it; restore a backup or remove the .wal file to start over");
                 goto fail;
             }
-            if (!walmap_find(p, 0, &woff)) {
-                rc = set_err(Q_ERR_CORRUPT,
-                    "database file is empty but the WAL holds committed data without its catalog page - refusing to destroy it; restore a backup or remove the .wal file to start over");
-                goto fail;
+            /* every page must be in the WAL: replaying a sparse set would
+               build a half-stale database whose checkpoint then destroys
+               the WAL evidence. Refuse with the WAL byte-identical. */
+            for (uint32_t pg = 0; pg < p->page_count; pg++) {
+                if (!walmap_find(p, pg, &woff)) {
+                    char msg[256];
+                    snprintf(msg, sizeof msg,
+                        "database file is empty but the WAL holds only part of the database (missing page %u of %u) - refusing to destroy it; restore a backup or remove the .wal file to start over",
+                        pg, (unsigned)p->page_count);
+                    rc = set_err(Q_ERR_CORRUPT, msg);
+                    goto fail;
+                }
             }
             put32(hdr + H_MAGIC, DB_MAGIC);
             put32(hdr + H_PAGES, 1);
@@ -392,8 +420,6 @@ int pager_open(struct pager **out, const char *path) {
             p->pending_count = p->page_count;
             replayed = 1;
         }
-    } else if (sz < Q_PAGE_SIZE) {
-        rc = set_err(Q_ERR_CORRUPT, "not a quarry database (bad header)"); goto fail;
     } else {
         ssize_t rr = read_full(p->fd, hdr, Q_PAGE_SIZE, 0);
         if (rr < 0) { rc = set_err(Q_ERR_IO, "database header read failed"); goto fail; }
@@ -517,6 +543,12 @@ int pager_commit(struct pager *p) {
                 return set_err(Q_ERR_NOMEM,
                     "WAL map rebuild failed; committed data is safe on disk - reopen the database");
             }
+            /* the rebuild re-scanned the whole WAL, so the in-memory frame
+               count is gone: resync it from the file or auto-checkpoint
+               would never fire again and the WAL would grow unbounded */
+            off_t wend = lseek(p->wal_fd, 0, SEEK_END);
+            p->frames_since_ckpt = wend > 16 ? (size_t)(wend - 16) / (FRAME_HDR + Q_PAGE_SIZE) : 0;
+            if (p->frames_since_ckpt >= 2000) pager_checkpoint(p);
             return Q_OK;
         }
         off += FRAME_HDR + Q_PAGE_SIZE;

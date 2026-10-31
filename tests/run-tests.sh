@@ -501,7 +501,7 @@ printf "CREATE TABLE t (id INT PRIMARY KEY);\n.checkpoint\nINSERT INTO t VALUES 
 : > "$T/r8d4.qry"   # main file lost; WAL holds frames but no catalog page
 out=$(printf "SELECT 1;\n" | "$BIN" "$T/r8d4.qry" 2>&1) && rc=0 || rc=$?
 case "$out" in
-  *"without its catalog page"*) echo "ok: empty main + catalogless WAL refuses as before";;
+  *"holds only part of the database"*) echo "ok: empty main + catalogless WAL refuses as before";;
   *) echo "FAIL: R8 D4 [$out]"; fails=$((fails + 1));;
 esac
 
@@ -552,6 +552,32 @@ elif cc -shared -fPIC -O2 tests/shim.c -o "$T/shim.so" -ldl 2>/dev/null; then
   # and it opens fine once the fault clears
   out=$(printf "SELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r8d3.qry" 2>&1)
   case "$out" in *"1"*) echo "ok: WAL replays after the read fault clears";; *) echo "FAIL: R8 D3 recovery [$out]"; fails=$((fails + 1));; esac
+
+  # R9 auto-checkpoint failure: a WAL truncate error at the 2000-frame
+  # auto-checkpoint is swallowed (the commit is durable), every later
+  # commit retries, and once the fault clears a checkpoint lands. A crash
+  # afterwards loses nothing.
+  rm -f "$T/r9ack.qry" "$T/r9ack.qry.wal" "$T/r9ack.mark" "$T/r9ack.fifo"
+  mkfifo "$T/r9ack.fifo"
+  QSHIM=1 QSHIM_MARKER="$T/r9ack.mark" QSHIM_FAIL_TRUNCATE=1 \
+    LD_PRELOAD="$T/shim.so" "$BIN" "$T/r9ack.qry" < "$T/r9ack.fifo" > "$T/r9ack.out" 2> "$T/r9ack.err" &
+  shim_pid=$!
+  { printf "CREATE TABLE t (id INT PRIMARY KEY);\n"
+    i=1; while [ $i -le 1990 ]; do printf "INSERT INTO t VALUES ($i);\n"; i=$((i+1)); done
+    sleep 1; touch "$T/r9ack.mark"
+    while [ $i -le 2290 ]; do printf "INSERT INTO t VALUES ($i);\n"; i=$((i+1)); done
+    sleep 1; rm "$T/r9ack.mark"
+    while [ $i -le 2340 ]; do printf "INSERT INTO t VALUES ($i);\n"; i=$((i+1)); done
+    printf ".crash\n"; sleep 1; } > "$T/r9ack.fifo"
+  wait $shim_pid && rc=0 || rc=$?
+  nerr=$(grep -c "error:" "$T/r9ack.err" || true)
+  nins=$(grep -c "1 row inserted." "$T/r9ack.out" || true)
+  n=$(printf "SELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r9ack.qry" 2>/dev/null | grep -x "2340")
+  if [ "$nins" = "2340" ] && [ "$nerr" = "0" ] && [ -n "$n" ]; then
+    echo "ok: failed auto-checkpoint swallowed, retried, no loss across .crash"
+  else
+    echo "FAIL: R9 auto-checkpoint (ins=$nins err=$nerr recovered=[$n])"; fails=$((fails + 1))
+  fi
   # N2: WAL write fails AND the tail truncate fails: the commit reports an
   # honest error, no success line prints, and later statements in the same
   # session are refused instead of being silently lost
@@ -696,15 +722,54 @@ esac
 [ "$m1" = "$m2" ] || { echo "FAIL: R7 bit-rot WAL modified"; fails=$((fails + 1)); }
 [ "$m1" = "$m2" ] && echo "ok: bit-rotted WAL refused, bytes preserved"
 
-# R7: torn WAL header + empty main file refuses like any other bad WAL
+# R7/R9: a sub-16-byte WAL provably holds no frame (frames start at offset
+# 16 and are 4120 bytes), so a torn header is reinitialized, never a
+# refusal: empty main starts fresh, intact main just opens
 rm -f "$T/r7torn.qry" "$T/r7torn.qry.wal"
 touch "$T/r7torn.qry"; printf 'ABCDEFGH' > "$T/r7torn.qry.wal"
 out=$(printf ".tables\n" | "$BIN" "$T/r7torn.qry" 2>&1 || true)
 case "$out" in
-  *"WAL header is torn"*) echo "ok: torn WAL header refused with an empty main file";;
-  *) echo "FAIL: R7 torn header: [$out]"; fails=$((fails + 1));;
+  *"(no tables)"*) echo "ok: torn WAL header reinitialized, empty main starts fresh";;
+  *) echo "FAIL: R9 torn header: [$out]"; fails=$((fails + 1));;
 esac
-[ "$(stat -c %s "$T/r7torn.qry.wal")" = "8" ] || { echo "FAIL: R7 torn WAL modified"; fails=$((fails + 1)); }
+[ "$(stat -c %s "$T/r7torn.qry.wal")" = "16" ] || { echo "FAIL: R9 torn WAL not reinitialized to a bare header"; fails=$((fails + 1)); }
+rm -f "$T/r9torn2.qry" "$T/r9torn2.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\n.checkpoint\n" | "$BIN" "$T/r9torn2.qry" >/dev/null 2>&1
+truncate -s 8 "$T/r9torn2.qry.wal"
+n=$(printf "SELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r9torn2.qry" 2>/dev/null | grep -cx "1")
+[ "$n" = "1" ] && echo "ok: torn WAL header with intact main opens with data" || { echo "FAIL: R9 torn header + intact main"; fails=$((fails + 1)); }
+
+# R9 D9-2: a partial main file (1-4095 bytes) attempts WAL replay exactly
+# like an empty one
+rm -f "$T/r9part.qry" "$T/r9part.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (7);\n.crash\n" | "$BIN" "$T/r9part.qry" >/dev/null 2>&1 || true
+truncate -s 100 "$T/r9part.qry"
+n=$(printf "SELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r9part.qry" 2>/dev/null | grep -cx "1")
+[ "$n" = "1" ] && echo "ok: partial main replays the WAL" || { echo "FAIL: R9 partial main"; fails=$((fails + 1)); }
+
+# R9 D9-3: replay requires EVERY page in the WAL map; a sparse WAL refuses
+# with the file byte-identical
+rm -f "$T/r9sparse.qry" "$T/r9sparse.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\n.checkpoint\nCREATE TABLE u (id INT PRIMARY KEY);\nINSERT INTO u VALUES (2);\n.crash\n" | "$BIN" "$T/r9sparse.qry" >/dev/null 2>&1 || true
+rm "$T/r9sparse.qry"
+m1=$(md5sum "$T/r9sparse.qry.wal" | cut -d' ' -f1)
+out=$(printf ".tables\n" | "$BIN" "$T/r9sparse.qry" 2>&1 || true)
+m2=$(md5sum "$T/r9sparse.qry.wal" | cut -d' ' -f1)
+case "$out" in
+  *"holds only part of the database"*) [ "$m1" = "$m2" ] && echo "ok: sparse WAL refuses, evidence preserved" || { echo "FAIL: R9 sparse WAL modified"; fails=$((fails + 1)); };;
+  *) echo "FAIL: R9 sparse replay: [$out]"; fails=$((fails + 1));;
+esac
+
+# R9: the unknown-format refusal now says how to recover
+rm -f "$T/r9unk.qry" "$T/r9unk.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\n.checkpoint\n" | "$BIN" "$T/r9unk.qry" >/dev/null 2>&1
+printf 'NOTQUARRYFORMAT!' | dd of="$T/r9unk.qry.wal" bs=1 count=16 conv=notrunc 2>/dev/null
+out=$(printf ".tables\n" | "$BIN" "$T/r9unk.qry" 2>&1 || true)
+case "$out" in
+  *"unknown format"*"remove the .wal file"*) echo "ok: unknown-format refusal carries recovery guidance";;
+  *) echo "FAIL: R9 unknown-format guidance: [$out]"; fails=$((fails + 1));;
+esac
+
 
 # R7: a refused open does not even trim garbage trailing the last commit
 rm -f "$T/r7tail.qry" "$T/r7tail.qry.wal"

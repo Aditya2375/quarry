@@ -151,7 +151,61 @@ def run_txn_scenario():
                         f"quarry={got[:3]}({len(got)}) sqlite={want[:3]}({len(want)})")
     return None
 
+def run_order_scenario():
+    """ORDER BY with heavy ties and NULLs, quarry vs sqlite. sqlite does not
+    promise an intra-tie order and quarry's qsort is not stable either, so
+    compare the key sequence exactly (this pins NULL placement, ASC and
+    DESC) and each tie group's row multiset."""
+    script = ["CREATE TABLE p (id INT PRIMARY KEY, age INT, name TEXT);"]
+    data = [(1, 30, "ada"), (2, None, "grace"), (3, 30, "alan"), (4, 25, None),
+            (5, None, "edsger"), (6, 30, "barbara"), (7, 25, "donald"),
+            (8, None, None), (9, 41, "dennis"), (10, 30, "ken")]
+    for i, a, n in data:
+        script.append(f"INSERT INTO p VALUES ({i}, {lit(a)}, {lit(n)});")
+    ref = sqlite3.connect(":memory:")
+    ref.isolation_level = None
+    ref.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, age INTEGER, name TEXT)")
+    ref.executemany("INSERT INTO p VALUES (?, ?, ?)", data)
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "o.qry")
+        p = subprocess.run([BIN, db], input="\n".join(script) + "\n",
+                           text=True, capture_output=True)
+        if p.returncode != 0:
+            return f"order scenario: quarry exited {p.returncode}: {p.stderr.strip()[:200]}"
+        for col, d in (("age", ""), ("age", "DESC"), ("name", ""), ("name", "DESC")):
+            sql = f"SELECT id, age, name FROM p ORDER BY {col} {d};"
+            q = subprocess.run([BIN, db, "-c", sql], text=True, capture_output=True)
+            if q.returncode != 0:
+                return f"order scenario: quarry rejected {sql}: {q.stderr.strip()[:200]}"
+            def pv(x, is_int):
+                x = x.strip()
+                return None if x == "NULL" else (int(x) if is_int else x)
+            got = []
+            for ln in q.stdout.splitlines()[1:]:
+                if ln.startswith("("):
+                    break
+                parts = [pv(x, i < 2) for i, x in enumerate(ln.split("|"))]
+                got.append(tuple(parts))
+            want = [tuple(r) for r in ref.execute(sql.rstrip(";"))]
+            keyidx = 1 if col == "age" else 2
+            gkeys = [r[keyidx] for r in got]
+            wkeys = [r[keyidx] for r in want]
+            if gkeys != wkeys:
+                return (f"order scenario: key sequence mismatch on {col} {d}: "
+                        f"quarry={gkeys} sqlite={wkeys}")
+            from itertools import groupby
+            for (kg, ggroup), (kw, wgroup) in zip(groupby(got, lambda r: r[keyidx]),
+                                                  groupby(want, lambda r: r[keyidx])):
+                if kg != kw or sorted(map(repr, ggroup)) != sorted(map(repr, wgroup)):
+                    return (f"order scenario: tie group {kg} mismatch on {col} {d}: "
+                            f"quarry={list(ggroup)} sqlite={list(wgroup)}")
+    return None
+
 fails = 0
+err = run_order_scenario()
+if err:
+    print(err)
+    fails += 1
 err = run_txn_scenario()
 if err:
     print(err)
