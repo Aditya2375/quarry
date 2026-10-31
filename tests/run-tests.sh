@@ -319,6 +319,119 @@ else
   echo "FAIL: R10-LOW2 unknown flag (rc=$rc) [$out]"; fails=$((fails + 1))
 fi
 
+# R11-HIGH: a leaf sibling link pointing at a non-leaf page must fail the
+# scan loudly, never walk interior bytes as packed leaf cells
+rm -f "$T/r11link.qry" "$T/r11link.qry.wal"
+python3 - "$BIN" "$T/r11link.qry" <<'PY'
+import os, struct, subprocess, sys
+bin_, db = sys.argv[1], sys.argv[2]
+seed = ["CREATE TABLE t (id INT PRIMARY KEY, v TEXT);"] + \
+       ["INSERT INTO t VALUES (%d, 'r%d');" % (i, i) for i in range(200)]
+r = subprocess.run([bin_, db], input="\n".join(seed) + "\n", text=True, capture_output=True)
+assert r.returncode == 0, r.stderr
+size = os.path.getsize(db)
+leaves, interiors = [], []
+with open(db, "rb") as f:
+    for pg in range(1, size // 4096):
+        f.seek(pg * 4096); t = f.read(1)
+        if t == b"\x01": leaves.append(pg)
+        elif t == b"\x02": interiors.append(pg)
+assert leaves and interiors, "expected a multi-level tree"
+d = open(db, "r+b")
+d.seek(leaves[0] * 4096 + 7)          # PH_LINK of a leaf
+d.write(struct.pack("<I", interiors[0]))
+d.close()
+PY
+out=$(printf "SELECT * FROM t;
+" | "$BIN" "$T/r11link.qry" 2>&1) && rc=0 || rc=$?
+if printf '%s
+' "$out" | grep -q "leaf sibling link points at a non-leaf page" && ! printf '%s
+' "$out" | grep -q "rows)"; then
+  echo "ok: scan refuses a leaf link to a non-leaf page"
+else
+  echo "FAIL: R11-HIGH (rc=$rc) [$out]"; fails=$((fails + 1))
+fi
+
+# R11-MED2: auto-assigned key at INT64_MAX is a clean error, never a
+# signed-overflow wrap to INT64_MIN
+rm -f "$T/r11key.qry" "$T/r11key.qry.wal"
+printf "CREATE TABLE t (v TEXT);
+INSERT INTO t VALUES ('a');
+" | "$BIN" "$T/r11key.qry" >/dev/null
+python3 - "$T/r11key.qry" <<'PY'
+import struct, sys
+d = open(sys.argv[1], "r+b")
+d.seek(4096 + 16)                      # page 1, first leaf cell: key
+d.write(struct.pack("<q", 0x7FFFFFFFFFFFFFFF))
+d.close()
+PY
+out=$(printf "INSERT INTO t VALUES ('b');
+" | "$BIN" "$T/r11key.qry" 2>&1) && rc=0 || rc=$?
+if printf '%s
+' "$out" | grep -q "cannot auto-assign a key" && ! printf '%s
+' "$out" | grep -q "1 row inserted"; then
+  echo "ok: auto-key overflow refused cleanly"
+else
+  echo "FAIL: R11-MED2 (rc=$rc) [$out]"; fails=$((fails + 1))
+fi
+
+# R11-MED3: interior splits and depth 3: 20000 wide rows force ~1100
+# leaves (well past the ~339-leaf interior-split point); the whole tree
+# must stay correct under count, ordered full scan, updates and deletes
+rm -f "$T/r11deep.qry" "$T/r11deep.qry.wal"
+python3 - "$BIN" "$T/r11deep.qry" <<'PY'
+import os, subprocess, sys
+bin_, db = sys.argv[1], sys.argv[2]
+V = "x" * 100
+seed = ["CREATE TABLE t (id INT PRIMARY KEY, v TEXT);"] + \
+       ["INSERT INTO t VALUES (%d, '%s');" % (i, V) for i in range(20000)]
+r = subprocess.run([bin_, db], input="\n".join(seed) + "\n", text=True, capture_output=True)
+assert r.returncode == 0, r.stderr[-300:]
+size = os.path.getsize(db)
+interiors = 0
+with open(db, "rb") as f:
+    for pg in range(1, size // 4096):
+        f.seek(pg * 4096)
+        if f.read(1) == b"\x02": interiors += 1
+# two interior pages can only exist once the root points at an interior:
+# depth is at least 3
+assert interiors >= 2, "expected interior splits (got %d interior pages)" % interiors
+def run(sql):
+    return subprocess.run([bin_, db, "-c", sql], text=True, capture_output=True)
+r = run("SELECT COUNT(*) FROM t;")
+assert "\n20000\n" in r.stdout, r.stdout[-200:]
+r = run("SELECT id FROM t;")
+lines = [l for l in r.stdout.splitlines() if l.strip().isdigit()]
+assert len(lines) == 20000, "full scan returned %d rows" % len(lines)
+keys = list(map(int, lines))
+assert keys == list(range(20000)), "ordered scan lost or reordered rows"
+r = run("UPDATE t SET v='u' WHERE id >= 19995;")
+assert "5 rows updated" in r.stdout, r.stdout[-200:]
+r = run("DELETE FROM t WHERE id >= 19990;")
+assert "10 rows deleted" in r.stdout, r.stdout[-200:]
+r = run("SELECT COUNT(*) FROM t;")
+assert "\n19990\n" in r.stdout, r.stdout[-200:]
+# structural validator: every leaf reachable from the interior level
+# exactly once, separators consistent, chain ordered and complete
+r = subprocess.run([bin_, db, "-validate"], text=True, capture_output=True)
+assert r.returncode == 0 and "validate: ok" in r.stdout, r.stdout + r.stderr
+print("ok: interior splits and depth 3 (20000 wide rows), validator agrees")
+PY
+
+# R11-LOW: sqlite treats a negative LIMIT as no limit
+rm -f "$T/r11lim.qry" "$T/r11lim.qry.wal"
+out=$(printf 'CREATE TABLE t (id INT PRIMARY KEY);
+INSERT INTO t VALUES (1);
+INSERT INTO t VALUES (2);
+INSERT INTO t VALUES (3);
+SELECT id FROM t ORDER BY id LIMIT -1;
+' | "$BIN" "$T/r11lim.qry" 2>&1)
+[ "$(printf '%s
+' "$out" | grep -c '^[0-9]*$')" = "3" ] \
+  && echo "ok: negative LIMIT is no limit (sqlite semantics)" \
+  || { echo "FAIL: R11-LOW negative LIMIT [$out]"; fails=$((fails + 1)); }
+[ $? -eq 0 ] || fails=$((fails + 1))
+
 # round-2 H3b regressions: PH_USED must match the packed cells, leaf key
 # order is enforced, and row field tags must match column types
 python3 - "$T" <<'PY'
@@ -915,6 +1028,11 @@ python3 tests/fuzz.py || fails=$((fails + 1))
 cc -std=gnu11 -O2 -g -Wall -Wextra -Werror -Isrc \
     tests/unit/test_btree.c src/pager.c src/btree.c -o "$T/test_btree"
 "$T/test_btree" || fails=$((fails + 1))
+# same model test with shrunken fanouts: reaches depth 4 with a few
+# thousand rows, exercising multi-level interior splits end to end
+cc -std=gnu11 -O2 -g -Wall -Wextra -Werror -Isrc -DQUARRY_TEST_TINY_PAGES \
+    tests/unit/test_btree.c src/pager.c src/btree.c -o "$T/test_btree_tiny"
+"$T/test_btree_tiny" || fails=$((fails + 1))
 
 # differential model against sqlite3 (skip gracefully without python3+sqlite3)
 if python3 -c 'import sqlite3' 2>/dev/null; then

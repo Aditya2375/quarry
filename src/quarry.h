@@ -85,6 +85,9 @@ int btree_delete(struct pager *p, uint32_t root, int64_t key);  /* missing key =
 int btree_find(struct pager *p, uint32_t root, int64_t key,
                uint8_t *buf, uint32_t *len_io);                 /* Q_ERR_SCHEMA if absent */
 int btree_max(struct pager *p, uint32_t root, int64_t *key_out); /* Q_ERR_SCHEMA if empty */
+/* structural invariant check (tests + fuzzer); depth_out may be NULL */
+int btree_validate(struct pager *p, uint32_t root, int *depth_out,
+                   char *err, size_t errlen);
 
 struct cursor {
     struct pager *p;
@@ -110,6 +113,8 @@ int  db_open(struct db **out, const char *path);
 int  db_close(struct db *d);
 void db_abandon(struct db *d);
 int  db_exec(struct db *d, const char *sql);        /* one statement */
+/* validate every B+tree in the database (catalog + all tables) */
+int  db_validate(struct db *d, char *err, size_t errlen);
 bool db_in_txn(struct db *d);                       /* explicit BEGIN open */
 int  db_checkpoint(struct db *d);
 int  db_list_tables(struct db *d);                  /* prints via q_out */

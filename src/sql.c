@@ -324,10 +324,10 @@ static int parse_tail(struct parser *ps, struct stmt *st) {
     }
     if (kw(ps, "LIMIT")) {
         next(ps);
-        if (ps->t.kind != T_NUM || ps->num_overflow || ps->t.num < 0)
-            return fail(ps, "LIMIT needs a non-negative integer");
-        st->limit = ps->t.num;
-        st->has_limit = true;
+        if (ps->t.kind != T_NUM || ps->num_overflow)
+            return fail(ps, "LIMIT needs an integer");
+        /* sqlite treats a negative LIMIT as no limit */
+        if (ps->t.num >= 0) { st->limit = ps->t.num; st->has_limit = true; }
         next(ps);
     }
     if (st->kind != S_SELECT && (st->has_order || st->has_limit))

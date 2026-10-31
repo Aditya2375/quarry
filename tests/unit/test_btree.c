@@ -21,7 +21,117 @@ static uint64_t xr(void) {
 
 #define NKEYS 5000
 
-int main(void) {
+/* ---- round-11: randomized-order model test with structural validation ---- */
+static void validate_or_die(struct pager *p, uint32_t root, int *depth_out) {
+    char verr[256] = {0};
+    int rc = btree_validate(p, root, depth_out, verr, sizeof verr);
+    if (rc != Q_OK) fprintf(stderr, "VALIDATOR: %s\n", verr);
+    CHECK(rc == Q_OK);
+}
+
+/* inserts nkeys shuffled keys with the given payload size, checking full
+   scan order, find(), duplicate rejection and structural validity as it
+   goes, then again after commit + close + reopen. */
+static void randomized_model(uint64_t seed_base, int nseeds, int nkeys,
+                             uint32_t payload_len, int64_t spread,
+                             int check_every, int min_depth) {
+    /* min_depth is the validator's leaf depth: 2 = three-level tree (what
+       the critic called depth 3), 3 = four levels ("depth 4"). */
+    for (int sd = 0; sd < nseeds; sd++) {
+        rng_state = seed_base + (uint64_t)sd * 1000003ull;
+        char path[64];
+        snprintf(path, sizeof path, "/tmp/quarry-unit-rand-%d.qry", (int)(seed_base % 100000) + sd);
+        unlink(path);
+        char wpath[80]; snprintf(wpath, sizeof wpath, "%s.wal", path); unlink(wpath);
+        struct pager *p;
+        CHECK(pager_open(&p, path) == Q_OK);
+        CHECK(pager_begin(p) == Q_OK);
+        uint32_t root;
+        CHECK(btree_create(p, &root) == Q_OK);
+
+        int64_t *keys = malloc(sizeof(int64_t) * (size_t)nkeys);
+        int64_t *model = malloc(sizeof(int64_t) * (size_t)nkeys);
+        uint8_t *pl = malloc(payload_len);
+        CHECK(keys && model && pl);
+        for (int i = 0; i < nkeys; i++)
+            keys[i] = (int64_t)i * spread - spread * (nkeys / 2);
+        for (int i = nkeys - 1; i > 0; i--) {
+            int j = (int)(xr() % (uint64_t)(i + 1));
+            int64_t t = keys[i]; keys[i] = keys[j]; keys[j] = t;
+        }
+        int nm = 0;
+        for (int i = 0; i < nkeys; i++) {
+            for (uint32_t b = 0; b < payload_len; b++)
+                pl[b] = (uint8_t)(keys[i] >> ((b % 8) * 8));
+            CHECK(btree_insert(p, &root, keys[i], pl, payload_len) == Q_OK);
+            int pos = nm;
+            while (pos > 0 && model[pos - 1] > keys[i]) { model[pos] = model[pos - 1]; pos--; }
+            model[pos] = keys[i]; nm++;
+            if ((i + 1) % 200 == 0) { CHECK(pager_commit(p) == Q_OK); CHECK(pager_begin(p) == Q_OK); }
+            if ((i + 1) % check_every == 0) {
+                validate_or_die(p, root, NULL);
+                struct cursor c;
+                CHECK(cursor_first(p, root, &c) == Q_OK);
+                int j = 0;
+                while (!c.done) {
+                    int64_t k; uint8_t o[1100]; uint32_t l = sizeof o;
+                    CHECK(cursor_get(&c, &k, o, &l) == Q_OK);
+                    CHECK(j < nm);
+                    CHECK(k == model[j]);
+                    CHECK(l == payload_len);
+                    j++;
+                    CHECK(cursor_next(&c) == Q_OK);
+                }
+                CHECK(j == nm);
+                for (int j2 = 0; j2 < nm; j2 += 25) {
+                    uint8_t o[1100]; uint32_t l = sizeof o;
+                    CHECK(btree_find(p, root, model[j2], o, &l) == Q_OK);
+                    CHECK(l == payload_len);
+                }
+                CHECK(btree_insert(p, &root, model[nm / 2], pl, payload_len) == Q_ERR_CONSTRAINT);
+            }
+        }
+        /* reopen: validate, find EVERY key with payload, full ordered scan */
+        CHECK(pager_commit(p) == Q_OK);
+        CHECK(pager_close(p) == Q_OK);
+        CHECK(pager_open(&p, path) == Q_OK);
+        int depth = 0;
+        validate_or_die(p, root, &depth);
+        fprintf(stderr, "  seed %d: %d keys, depth %d\n", sd, nkeys, depth);
+        CHECK(depth >= min_depth);
+        for (int i = 0; i < nkeys; i++) {
+            uint8_t o[1100]; uint32_t l = sizeof o;
+            CHECK(btree_find(p, root, model[i], o, &l) == Q_OK);
+            CHECK(l == payload_len);
+            for (uint32_t b = 0; b < payload_len; b++)
+                pl[b] = (uint8_t)(model[i] >> ((b % 8) * 8));
+            CHECK(memcmp(o, pl, payload_len) == 0);
+        }
+        {
+            struct cursor c;
+            CHECK(cursor_first(p, root, &c) == Q_OK);
+            int j = 0;
+            while (!c.done) {
+                int64_t k; uint8_t o[1100]; uint32_t l = sizeof o;
+                CHECK(cursor_get(&c, &k, o, &l) == Q_OK);
+                CHECK(j < nm);
+                CHECK(k == model[j]);
+                j++;
+                CHECK(cursor_next(&c) == Q_OK);
+            }
+            CHECK(j == nm);
+        }
+        CHECK(pager_close(p) == Q_OK);
+        unlink(path);
+        unlink(wpath);
+        free(keys); free(model); free(pl);
+    }
+}
+
+
+
+#ifndef QUARRY_TEST_TINY_PAGES
+static void model_and_corruption(void) {
     const char *path = "/tmp/quarry-unit.qry";
     unlink(path);
     unlink("/tmp/quarry-unit.qry.wal");
@@ -210,6 +320,21 @@ int main(void) {
     unlink(cpath);
     unlink("/tmp/quarry-unit-corrupt.qry.wal");
 
+}
+
+#endif
+
+int main(void) {
+#ifdef QUARRY_TEST_TINY_PAGES
+    /* shrunken fanouts: depth-4 trees with a few thousand rows */
+    randomized_model(4242, 2, 4000, 8, 3, 500, 4);
+    printf("%ld tiny-page checks passed (depth-4 randomized model)\n", checks);
+#else
+    model_and_corruption();
+    /* random-order inserts at depth 3 with fat payloads: the shape that
+       used to orphan leaves from the interior level */
+    randomized_model(42, 3, 12000, 200, 13, 500, 2);
     printf("%ld checks passed\n", checks);
+#endif
     return 0;
 }

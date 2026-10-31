@@ -18,7 +18,7 @@
 #include <ctype.h>
 
 static void usage(FILE *f) {
-    fputs("usage: quarry [file.qry] [-c \"SQL\"]\n"
+    fputs("usage: quarry [file.qry] [-c \"SQL\"] [-validate]\n"
           "  .tables         list tables\n"
           "  .schema NAME    show a table's CREATE statement\n"
           "  .open FILE      switch database file\n"
@@ -47,11 +47,13 @@ static long find_stmt_end(const char *buf) {
 int main(int argc, char **argv) {
     const char *path = "quarry.db";
     const char *one = NULL;
+    int do_validate = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-c")) {
             if (i + 1 >= argc) { usage(stderr); return 2; }
             one = argv[++i];
         }
+        else if (!strcmp(argv[i], "-validate")) { do_validate = 1; }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout); return 0; }
         else if (argv[i][0] == '-') { usage(stderr); return 2; }  /* never create a file named "-c" */
         else path = argv[i];
@@ -59,6 +61,16 @@ int main(int argc, char **argv) {
 
     struct db *d = NULL;
     if (db_open(&d, path) != Q_OK) { fprintf(stderr, "error: %s\n", q_err); return 1; }
+
+    if (do_validate) {
+        char verr[256] = {0};
+        if (db_validate(d, verr, sizeof verr) != Q_OK) {
+            fprintf(stderr, "validate: %s\n", verr); db_close(d); return 1;
+        }
+        puts("validate: ok");
+        if (db_close(d) != Q_OK) { fprintf(stderr, "error: %s\n", q_err); return 1; }
+        return 0;
+    }
 
     if (one) {
         if (db_exec(d, one) != Q_OK) { fprintf(stderr, "error: %s\n", q_err); db_close(d); return 1; }

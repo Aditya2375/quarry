@@ -11,4 +11,4 @@ ERROR: syntax error: integer literal out of range
 ID                   | V
 -9223372036854775808 | min
 (1 row)
-ERROR: syntax error: LIMIT needs a non-negative integer
+ERROR: syntax error: LIMIT needs an integer

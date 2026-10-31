@@ -133,6 +133,28 @@ static int save_table(struct db *d, struct tabledef *t) {
     return Q_OK;
 }
 
+/* validate the catalog tree and every table tree (tests + fuzzer) */
+int db_validate(struct db *d, char *err, size_t errlen) {
+    uint32_t catroot; uint64_t seq;
+    int rc = pager_get_catalog(d->pg, &catroot, &seq);
+    if (rc != Q_OK) { snprintf(err, errlen, "catalog: %s", q_err); return rc; }
+    if (catroot) {
+        rc = btree_validate(d->pg, catroot, NULL, err, errlen);
+        if (rc != Q_OK) return rc;
+    }
+    rc = load_catalog(d);
+    if (rc != Q_OK) { snprintf(err, errlen, "catalog: %s", q_err); return rc; }
+    for (int i = 0; i < d->ntabs; i++) {
+        char tbuf[256];
+        rc = btree_validate(d->pg, d->tabs[i].root, NULL, tbuf, sizeof tbuf);
+        if (rc != Q_OK) {
+            snprintf(err, errlen, "table %s: %s", d->tabs[i].name, tbuf);
+            return rc;
+        }
+    }
+    return Q_OK;
+}
+
 static struct tabledef *find_table(struct db *d, const char *name) {
     for (int i = 0; i < d->ntabs; i++)
         if (strcmp(d->tabs[i].name, name) == 0) return &d->tabs[i];
@@ -294,8 +316,12 @@ static int exec_insert(struct db *d, struct stmt *st) {
     if (t->cols[0].is_pk) {
         key = vals[0].i;
     } else {
-        if (btree_max(d->pg, t->root, &key) == Q_OK) key++;
-        else key = 1;
+        if (btree_max(d->pg, t->root, &key) == Q_OK) {
+            if (key == INT64_MAX)
+                return fail(Q_ERR_TOO_BIG,
+                            "cannot auto-assign a key: INT64_MAX already used");
+            key++;
+        } else key = 1;
     }
     uint32_t need = 0;
     for (int i = 0; i < t->ncols; i++)

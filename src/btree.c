@@ -14,6 +14,8 @@
  */
 #include "quarry.h"
 
+#include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,6 +98,15 @@ static int get_checked(struct pager *p, uint32_t pgno, const uint8_t **pg) {
     if (rc != Q_OK) return rc;
     return page_check(*pg);
 }
+/* cursor hops trust a sibling link's target to be a leaf; a corrupt link
+   must not get an interior page walked as packed leaf cells */
+static int get_leaf_checked(struct pager *p, uint32_t pgno, const uint8_t **pg) {
+    int rc = get_checked(p, pgno, pg);
+    if (rc != Q_OK) return rc;
+    if ((*pg)[PH_TYPE] != PT_LEAF)
+        return corrupt("leaf sibling link points at a non-leaf page");
+    return Q_OK;
+}
 static int get_mut_checked(struct pager *p, uint32_t pgno, uint8_t **pg) {
     int rc = pager_get_mut(p, pgno, pg);
     if (rc != Q_OK) return rc;
@@ -120,6 +131,19 @@ static int leaf_lower_bound(const uint8_t *pg, int64_t key) {
     }
     return n;
 }
+
+/* ---------- capacity ---------- */
+/* test-only knob: -DQUARRY_TEST_TINY_PAGES shrinks fanouts so unit tests
+   reach depth 4 with a few thousand rows.  Never set in shipped builds. */
+#ifdef QUARRY_TEST_TINY_PAGES
+static uint32_t leaf_capacity(void) { return (Q_PAGE_SIZE - PH_SIZE) / 64; }
+static int int_fits(int n_after) { return n_after <= 8; }
+#else
+static uint32_t leaf_capacity(void) { return Q_PAGE_SIZE - PH_SIZE; }
+static int int_fits(int n_after) {
+    return (size_t)n_after * INT_CELL_SIZE <= Q_PAGE_SIZE - PH_SIZE - 16;
+}
+#endif
 
 /* ---------- interior helpers ---------- */
 static uint32_t int_cell_off(int i) { return PH_SIZE + (uint32_t)i * INT_CELL_SIZE; }
@@ -152,6 +176,157 @@ static void int_insert_cell_at(uint8_t *pg, int pos, int64_t key, uint32_t child
 int cursor_first(struct pager *p, uint32_t root, struct cursor *c);
 int cursor_next(struct cursor *c);
 int cursor_get(struct cursor *c, int64_t *key, uint8_t *buf, uint32_t *len_io);
+
+
+/* ---------- structural validator ----------
+   Full invariant check for tests and the fuzzer: every leaf reachable
+   from the interior level exactly once, separators consistent with
+   subtree contents, all leaves at one depth, and the leaf chain ordered
+   and complete.  Returns Q_OK or Q_ERR_CORRUPT with a message. */
+struct vctx {
+    struct pager *p;
+    uint8_t *leafmark;   /* bitmap over npages: leaf seen from interiors */
+    uint32_t npages;
+    int leaf_depth;      /* -1 until the first leaf */
+    uint32_t nleaves;
+    char *err; size_t errlen;
+};
+
+static int vfail(struct vctx *v, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(v->err, v->errlen, fmt, ap);
+    va_end(ap);
+    return Q_ERR_CORRUPT;
+}
+
+static int validate_rec(struct vctx *v, uint32_t pgno, int depth,
+                        bool has_lo, int64_t lo, bool has_hi, int64_t hi) {
+    if (depth >= MAX_DEPTH) return vfail(v, "validate: deeper than %d levels", MAX_DEPTH);
+    if (pgno >= v->npages) return vfail(v, "validate: child page %u out of range", pgno);
+    const uint8_t *fetched;
+    int rc = get_checked(v->p, pgno, &fetched);
+    if (rc != Q_OK) {
+        snprintf(v->err, v->errlen, "validate: page %u: %s", pgno, q_err);
+        return rc;
+    }
+    /* pager_get serves clean pages from a rotating 32-slot read buffer;
+       the child recursion below would reuse the slot under our feet */
+    uint8_t snap[Q_PAGE_SIZE];
+    memcpy(snap, fetched, Q_PAGE_SIZE);
+    const uint8_t *pg = snap;
+    int n = g16(pg + PH_NCELLS);
+    if (pg[PH_TYPE] == PT_LEAF) {
+        if (v->leafmark[pgno / 8] & (1u << (pgno % 8)))
+            return vfail(v, "validate: leaf %u reachable twice", pgno);
+        v->leafmark[pgno / 8] |= 1u << (pgno % 8);
+        if (v->leaf_depth < 0) v->leaf_depth = depth;
+        else if (v->leaf_depth != depth)
+            return vfail(v, "validate: leaf %u at depth %d, first leaf at %d",
+                         pgno, depth, v->leaf_depth);
+        v->nleaves++;
+        int64_t prev = 0;
+        uint32_t off = PH_SIZE;
+        for (int i = 0; i < n; i++) {
+            if (off + LEAF_CELL_HDR > Q_PAGE_SIZE)
+                return vfail(v, "validate: leaf %u cell array overruns page", pgno);
+            int64_t k = g64(pg + off);
+            uint16_t cl = g16(pg + off + 8);
+            if (i && k <= prev)
+                return vfail(v, "validate: leaf %u keys out of order", pgno);
+            if (has_lo && k < lo)
+                return vfail(v, "validate: leaf %u key %lld below separator %lld",
+                             pgno, (long long)k, (long long)lo);
+            if (has_hi && k >= hi)
+                return vfail(v, "validate: leaf %u key %lld at/above separator %lld",
+                             pgno, (long long)k, (long long)hi);
+            prev = k;
+            off += LEAF_CELL_HDR + cl;
+        }
+        if (off > Q_PAGE_SIZE)
+            return vfail(v, "validate: leaf %u content overruns page", pgno);
+        return Q_OK;
+    }
+    /* interior */
+    int64_t prevk = 0;
+    for (int i = 0; i <= n; i++) {
+        bool clo = has_lo, chi = has_hi;
+        int64_t clov = lo, chiv = hi;
+        uint32_t child;
+        if (i < n) {
+            int64_t k = g64(pg + int_cell_off(i));
+            if (i && k <= prevk)
+                return vfail(v, "validate: interior %u separators out of order", pgno);
+            if (has_lo && k < lo)
+                return vfail(v, "validate: interior %u separator below parent bound", pgno);
+            if (has_hi && k >= hi)
+                return vfail(v, "validate: interior %u separator at/above parent bound", pgno);
+            prevk = k;
+            chiv = k; chi = true;
+            child = g32(pg + int_cell_off(i) + 8);
+        } else {
+            child = g32(pg + PH_LINK);
+        }
+        if (i > 0) { clov = g64(pg + int_cell_off(i - 1)); clo = true; }
+        if (child == pgno)
+            return vfail(v, "validate: interior %u points at itself", pgno);
+        rc = validate_rec(v, child, depth + 1, clo, clov, chi, chiv);
+        if (rc != Q_OK) return rc;
+    }
+    return Q_OK;
+}
+
+int btree_validate(struct pager *p, uint32_t root, int *depth_out,
+                   char *err, size_t errlen) {
+    struct vctx v;
+    v.p = p; v.leaf_depth = -1; v.nleaves = 0; v.err = err; v.errlen = errlen;
+    v.npages = pager_pending_count(p);   /* includes pages allocated in the open txn */
+    v.leafmark = calloc((v.npages + 7) / 8, 1);
+    if (!v.leafmark) return oom();
+    int rc = validate_rec(&v, root, 0, false, 0, false, 0);
+    if (rc == Q_OK) {
+        /* descend to the leftmost leaf, then walk the sibling chain */
+        uint32_t pgno = root;
+        for (int d = 0;; d++) {
+            if (d >= MAX_DEPTH) { rc = vfail(&v, "validate: leftmost descent cycles"); break; }
+            const uint8_t *pg;
+            rc = get_checked(p, pgno, &pg);
+            if (rc != Q_OK) break;
+            if (pg[PH_TYPE] == PT_LEAF) break;
+            pgno = g16(pg + PH_NCELLS) ? g32(pg + int_cell_off(0) + 8) : g32(pg + PH_LINK);
+        }
+        int64_t prevk = 0; int have_prev = 0; uint32_t seen = 0;
+        while (rc == Q_OK && pgno) {
+            if (pgno >= v.npages) { rc = vfail(&v, "validate: leaf chain out of range"); break; }
+            if (!(v.leafmark[pgno / 8] & (1u << (pgno % 8)))) {
+                rc = vfail(&v, "validate: leaf %u in chain but not reachable from root", pgno);
+                break;
+            }
+            v.leafmark[pgno / 8] &= (uint8_t)~(1u << (pgno % 8));  /* consume */
+            seen++;
+            const uint8_t *pg;
+            rc = get_checked(p, pgno, &pg);
+            if (rc != Q_OK) break;
+            int n = g16(pg + PH_NCELLS);
+            uint32_t off = PH_SIZE;
+            for (int i = 0; i < n && rc == Q_OK; i++) {
+                int64_t k = g64(pg + off);
+                uint16_t cl = g16(pg + off + 8);
+                if (have_prev && k <= prevk)
+                    rc = vfail(&v, "validate: chain order breaks at leaf %u", pgno);
+                prevk = k; have_prev = 1;
+                off += LEAF_CELL_HDR + cl;
+            }
+            if (rc != Q_OK) break;
+            pgno = g32(pg + PH_LINK);
+        }
+        if (rc == Q_OK && seen != v.nleaves)
+            rc = vfail(&v, "validate: %u leaves reachable from interiors, %u in chain",
+                       v.nleaves, seen);
+    }
+    if (rc == Q_OK && depth_out) *depth_out = v.leaf_depth;
+    free(v.leafmark);
+    return rc;
+}
 
 int btree_create(struct pager *p, uint32_t *root_out) {
     uint32_t pgno; uint8_t *pg;
@@ -268,13 +443,13 @@ static int insert_rec(struct pager *p, uint32_t pgno, int64_t key,
                      len, Q_MAX_ROW_BYTES);
             return Q_ERR_TOO_BIG;
         }
-        if (need > Q_PAGE_SIZE - PH_SIZE) {
+        if (need > Q_PAGE_SIZE - PH_SIZE || need > leaf_capacity()) {
             snprintf(q_err, sizeof q_err, "row too large (%u bytes, limit %d)",
                      len, Q_MAX_ROW_BYTES);
             return Q_ERR_TOO_BIG;
         }
         uint32_t used = g32(pg + PH_USED);
-        if (used + need <= Q_PAGE_SIZE - PH_SIZE) {
+        if (used + need <= leaf_capacity()) {
             uint32_t at = leaf_cell_off(pg, pos);
             uint32_t tail_at = leaf_cell_off(pg, n);
             memmove(pg + at + need, pg + at, tail_at - at);
@@ -363,7 +538,7 @@ static int insert_rec(struct pager *p, uint32_t pgno, int64_t key,
     if (rc != Q_OK) return rc;
 
     int n = g16(pg + PH_NCELLS);
-    if ((size_t)(n + 1) * INT_CELL_SIZE <= Q_PAGE_SIZE - PH_SIZE - 16) {
+    if (int_fits(n + 1)) {
         /* child page split into [child] (keys < sep) and [sub.child] (keys
            >= sep): new cell is (sep, child); the cell that used to point
            past it (or the rightmost pointer) now leads to sub.child. */
@@ -411,10 +586,18 @@ static int insert_rec(struct pager *p, uint32_t pgno, int64_t key,
     /* re-fetch: pager_alloc may have moved the dirty array */
     rc = pager_get_mut(p, pgno, &pg);
     if (rc != Q_OK) { free(keys); free(kids); return rc; }
+    /* Rewrite the left page FROM THE ARRAYS, not from its old bytes:
+       when the inserted cell landed left of mid, the logical left half
+       is not the old physical prefix - it contains the new cell and has
+       surrendered old cell mid-1 as the promoted separator.  Keeping the
+       old prefix drops the new cell entirely, orphaning sub.child from
+       the interior level while it stays linked in the leaf chain. */
+    memset(pg + PH_SIZE, 0, Q_PAGE_SIZE - PH_SIZE);
     pg[PH_TYPE] = PT_INTERIOR;
     p16(pg + PH_NCELLS, (uint16_t)mid);
-    for (int i = mid; i < n; i++) { /* clear tail (optional hygiene) */
-        memset(pg + int_cell_off(i), 0, INT_CELL_SIZE);
+    for (int i = 0; i < mid; i++) {
+        p64(pg + int_cell_off(i), keys[i]);
+        p32(pg + int_cell_off(i) + 8, kids[i]);
     }
     p32(pg + PH_LINK, kids[mid]);
 
@@ -484,7 +667,7 @@ int cursor_first(struct pager *p, uint32_t root, struct cursor *c) {
     /* skip leading empty leaves; a corrupt sibling cycle must not loop */
     for (;;) {
         const uint8_t *pg;
-        int rc = get_checked(p, c->leaf, &pg);
+        int rc = get_leaf_checked(p, c->leaf, &pg);
         if (rc != Q_OK) return rc;
         if (g16(pg + PH_NCELLS) > 0) return Q_OK;
         uint32_t next = g32(pg + PH_LINK);
@@ -497,7 +680,7 @@ int cursor_first(struct pager *p, uint32_t root, struct cursor *c) {
 int cursor_next(struct cursor *c) {
     if (c->done) return Q_OK;
     const uint8_t *pg;
-    int rc = get_checked(c->p, c->leaf, &pg);
+    int rc = get_leaf_checked(c->p, c->leaf, &pg);
     if (rc != Q_OK) return rc;
     c->idx++;
     for (;;) {
@@ -507,7 +690,7 @@ int cursor_next(struct cursor *c) {
         c->leaf = next;
         c->idx = 0;
         if (++c->steps > c->limit) return corrupt("leaf sibling chain loops");
-        rc = get_checked(c->p, c->leaf, &pg);
+        rc = get_leaf_checked(c->p, c->leaf, &pg);
         if (rc != Q_OK) return rc;
     }
 }
@@ -515,7 +698,7 @@ int cursor_next(struct cursor *c) {
 int cursor_get(struct cursor *c, int64_t *key, uint8_t *buf, uint32_t *len_io) {
     if (c->done) { snprintf(q_err, sizeof q_err, "cursor exhausted"); return Q_ERR_SCHEMA; }
     const uint8_t *pg;
-    int rc = get_checked(c->p, c->leaf, &pg);
+    int rc = get_leaf_checked(c->p, c->leaf, &pg);
     if (rc != Q_OK) return rc;
     uint32_t off = leaf_cell_off(pg, c->idx);
     uint16_t len = g16(pg + off + 8);

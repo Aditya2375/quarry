@@ -71,6 +71,20 @@ def garbage_sql(rng):
     return "\n".join(lines) + "\n"
 
 
+def validate(db, tag, expect_ok):
+    # structural validator over every B+tree in the database; must never
+    # crash or hang, and a healthy database must always validate clean
+    try:
+        r = subprocess.run([BIN, db, "-validate"], text=True, errors="replace",
+                           capture_output=True, timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("%s: validator hung" % tag)
+    check(r, tag)
+    if expect_ok:
+        assert r.returncode == 0 and "validate: ok" in r.stdout, \
+            "%s: validator rejected a healthy database: %r" % (
+                tag, ((r.stdout or "") + (r.stderr or ""))[:300])
+
 def fuzz_sql(rng, tmp):
     for i in range(SQL_ROUNDS):
         db = os.path.join(tmp, "fuzzsql.qry")
@@ -78,6 +92,8 @@ def fuzz_sql(rng, tmp):
             subprocess.run([BIN, db], input="CREATE TABLE t (id INT PRIMARY KEY, v TEXT);\n",
                            text=True, capture_output=True)
         check(run(db, garbage_sql(rng)), "sql round %d" % i)
+        if i % 10 == 0:
+            validate(db, "sql round %d" % i, True)
     print("ok: fuzz: %d rounds of garbage SQL, no crash or hang" % SQL_ROUNDS)
 
 
@@ -105,11 +121,13 @@ def corrupt_targeted(rng, db, size):
                 f.write(rng.choice([b"\x00\x00\x00\x00", b"\xff\xff\xff\xff",
                                     (16).to_bytes(4, "little"),
                                     (4096).to_bytes(4, "little")]))
-            else:  # link: self-cycle, huge, or zero
+            else:  # link: self-cycle, huge, zero, another leaf, an
+                # interior page, or a page whose type was scribbled
+                target = rng.choice([pgno, 0xFFFFFFFF, 1,
+                                     rng.randrange(1, npages),
+                                     rng.randrange(1, npages)])
                 f.seek(base + 7)
-                f.write(rng.choice([pgno.to_bytes(4, "little"),
-                                    b"\xff\xff\xff\xff",
-                                    (1).to_bytes(4, "little")]))
+                f.write(target.to_bytes(4, "little"))
 
 
 def fuzz_disk(rng, tmp):
@@ -119,14 +137,31 @@ def fuzz_disk(rng, tmp):
             if os.path.exists(f):
                 os.unlink(f)
         # most rounds stay small (single leaf); the rest grow past several
-        # levels of interior pages so corruption can hit interior cells
-        nrows = rng.randint(1, 120) if rng.random() < 0.6 else rng.randint(121, 1500)
-        seed = "CREATE TABLE t (id INT PRIMARY KEY, v TEXT);\n" + "".join(
-            "INSERT INTO t VALUES (%d, 'r%d');\n" % (k, k)
-            for k in range(nrows))
+        # levels of interior pages so corruption can hit interior cells.
+        # A few rounds go deep: wide rows force 300+ leaves, which splits
+        # interior pages and reaches depth 3.
+        roll = rng.random()
+        if roll < 0.6:
+            nrows, wide = rng.randint(1, 120), False
+        elif roll < 0.95:
+            nrows, wide = rng.randint(121, 1500), False
+        else:
+            nrows, wide = 13000, True
+        pk = rng.random() < 0.7
+        if pk:
+            seed = "CREATE TABLE t (id INT PRIMARY KEY, v TEXT);\n" + "".join(
+                "INSERT INTO t VALUES (%d, 'r%d');\n" % (k, k)
+                for k in range(nrows))
+        else:  # auto-keyed table: exercises the non-PK insert path
+            v = "w" * 100 if wide else "r"
+            seed = "CREATE TABLE t (v TEXT);\n" + "".join(
+                "INSERT INTO t VALUES ('%s%d');\n" % (v, k)
+                for k in range(nrows))
         r = subprocess.run([BIN, db], input=seed, text=True,
                            errors="replace", capture_output=True)
         assert r.returncode == 0, r.stderr
+        if i % 5 == 0:  # the freshly seeded tree must always validate
+            validate(db, "disk round %d seeded" % i, True)
         size = os.path.getsize(db)
         mode = rng.random()
         if mode < 0.45:  # flip random bytes
@@ -146,12 +181,23 @@ def fuzz_disk(rng, tmp):
         # probe reads AND writes: a cyclic or mis-linked interior page must
         # be a clean corruption error on INSERT/UPDATE/DELETE too, never a
         # crash or a hang
-        check(run(db, "SELECT COUNT(*) FROM t;\n.tables\n"
-                      "INSERT INTO t VALUES (2000001, 'probe');\n"
-                      "UPDATE t SET v='probe' WHERE id=3;\n"
-                      "DELETE FROM t WHERE id=4;\n"
-                      "INSERT INTO t VALUES (2000002, 'probe2');\n"
-                      "SELECT COUNT(*) FROM t;\n"), "disk round %d" % i)
+        if pk:
+            probe = ("SELECT COUNT(*) FROM t;\n.tables\n"
+                     "INSERT INTO t VALUES (2000001, 'probe');\n"
+                     "UPDATE t SET v='probe' WHERE id=3;\n"
+                     "DELETE FROM t WHERE id=4;\n"
+                     "INSERT INTO t VALUES (2000002, 'probe2');\n"
+                     "SELECT COUNT(*) FROM t;\n")
+        else:
+            probe = ("SELECT COUNT(*) FROM t;\n.tables\n"
+                     "INSERT INTO t VALUES ('probe');\n"
+                     "UPDATE t SET v='probe' WHERE v='r3';\n"
+                     "DELETE FROM t WHERE v='r4';\n"
+                     "INSERT INTO t VALUES ('probe2');\n"
+                     "SELECT COUNT(*) FROM t;\n")
+        check(run(db, probe), "disk round %d" % i)
+        # corrupted images may validate or fail; both must be clean outcomes
+        validate(db, "disk round %d corrupted" % i, False)
     print("ok: fuzz: %d rounds of on-disk corruption, no crash or hang" % DISK_ROUNDS)
 
 

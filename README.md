@@ -41,7 +41,8 @@ make check                    # full test suite
 - **SQL subset.** `CREATE TABLE` (INT / TEXT columns, one optional INT
   `PRIMARY KEY`), `INSERT` (positional or named columns), `SELECT` with
   `WHERE` (ANDed `= != < <= > >=`), `ORDER BY`, `LIMIT`, `COUNT(*)`,
-  `UPDATE`, `DELETE`. NULLs supported with SQL three-valued logic:
+  `UPDATE`, `DELETE`. A negative `LIMIT` means no limit, as in SQLite.
+  NULLs supported with SQL three-valued logic:
   a `WHERE` comparison that touches NULL never matches the row. There is
   no `IS NULL` syntax; `= NULL` parses but, per three-valued logic, never
   matches.
@@ -55,16 +56,25 @@ make check                    # full test suite
   scan-long cycle budget, and recovery truncates the WAL at the last valid
   commit boundary, so a corrupted file produces a clean error, not a crash
   or an infinite loop.
-- **Tested like it matters.** 38,395 pager/B+tree unit checks (insert /
-  find / scan / delete against a model, with commit-close-reopen and
-  crash-recovery cycles, plus corrupt-page rejection), scripted CRUD /
+- **Tested like it matters.** 2,613,079 pager/B+tree unit checks: insert /
+  find / scan / delete against a model with commit-close-reopen and
+  crash-recovery cycles and corrupt-page rejection, plus a
+  randomized-order model test that grows the tree to depth 3 with wide
+  rows and, in a shrunken-fanout build, to depth 4 with tiny rows,
+  checking full scan order, point lookups of every key, duplicate-key
+  rejection and a structural validator (every leaf reachable from the
+  interior level exactly once, separators consistent, leaf chain ordered
+  and complete) after every few hundred inserts. Scripted CRUD /
   transaction / error / NULL-semantics cases, a 20,000-row stress run
   that forces interior splits, fault injection that fails a commit
   mid-WAL-write via `RLIMIT_FSIZE`, and a differential test that runs
   random workloads against SQLite and compares the full table contents.
   The whole suite also runs under ASan + UBSan in CI, and the shipped
   fuzzer (`tests/fuzz.py`) throws 300 rounds of garbage SQL and 200
-  rounds of on-disk corruption per run with no crash and no hang.
+  rounds of on-disk corruption per run with no crash and no hang, with
+  the structural validator checking the tree throughout. The same
+  validator is available on any database file via `quarry file.qry
+  -validate`.
 
 ## Honest limits
 
