@@ -75,8 +75,10 @@ int main(int argc, char **argv) {
                 if (!nl) break;
                 *nl = 0;
                 char cmd[4000];
-                strncpy(cmd, buf, sizeof cmd - 1);
-                cmd[sizeof cmd - 1] = 0;
+                size_t cn = strlen(buf);
+                if (cn >= sizeof cmd) cn = sizeof cmd - 1;
+                memcpy(cmd, buf, cn);
+                cmd[cn] = 0;
                 memmove(buf, nl + 1, strlen(nl + 1) + 1);
                 blen = strlen(buf);
                 char *arg = strchr(cmd, ' ');

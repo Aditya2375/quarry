@@ -51,6 +51,12 @@ static int fail(int code, const char *fmt, ...) {
     return code;
 }
 
+static void copy_name(char *dst, size_t cap, const char *src) {
+    size_t n = strlen(src);
+    if (n >= cap) n = cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
 static void cat_encode(const struct tabledef *t, uint8_t *rec) {
     memset(rec, 0, CAT_REC_LEN);
     snprintf((char *)rec + CAT_NAME, 32, "%s", t->name);
@@ -58,20 +64,20 @@ static void cat_encode(const struct tabledef *t, uint8_t *rec) {
     p32(rec + CAT_NCOLS, (uint32_t)t->ncols);
     for (int i = 0; i < t->ncols; i++) {
         uint8_t *c = rec + CAT_COLS + i * 34;
-        snprintf((char *)c, 32, "%s", t->cols[i].name);
+        copy_name((char *)c, 32, t->cols[i].name);
         c[32] = (uint8_t)t->cols[i].type;
         c[33] = (uint8_t)t->cols[i].is_pk;
     }
 }
 static void cat_decode(const uint8_t *rec, struct tabledef *t) {
     memset(t, 0, sizeof *t);
-    snprintf(t->name, sizeof t->name, "%s", (char *)rec + CAT_NAME);
+    copy_name(t->name, sizeof t->name, (char *)rec + CAT_NAME);
     t->root = g32(rec + CAT_ROOT);
     t->ncols = (int)g32(rec + CAT_NCOLS);
     if (t->ncols > Q_MAX_COLS) t->ncols = Q_MAX_COLS;
     for (int i = 0; i < t->ncols; i++) {
         const uint8_t *c = rec + CAT_COLS + i * 34;
-        snprintf(t->cols[i].name, sizeof t->cols[i].name, "%s", (char *)c);
+        copy_name(t->cols[i].name, sizeof t->cols[i].name, (char *)c);
         t->cols[i].type = c[32];
         t->cols[i].is_pk = c[33];
     }
