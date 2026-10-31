@@ -1,0 +1,44 @@
+table EMPLOYEES created.
+1 row inserted.
+1 row inserted.
+1 row inserted.
+1 row inserted.
+EMPLOYEES
+CREATE TABLE EMPLOYEES (
+  ID INT PRIMARY KEY,
+  NAME TEXT,
+  ROLE TEXT,
+  SALARY INT
+);
+ID | NAME   | ROLE     | SALARY
+1  | Ada    | engineer | 120
+2  | Grace  | manager  | 150
+3  | Linus  | engineer | 110
+4  | Edsger | engineer | NULL
+(4 rows)
+NAME  | SALARY
+Ada   | 120
+Linus | 110
+(2 rows)
+count
+4
+(1 row)
+count
+2
+(1 row)
+1 row updated.
+ID | SALARY
+3  | 125
+(1 row)
+1 row updated.
+NAME | ROLE   | SALARY
+Ada  | fellow | 200
+(1 row)
+1 row deleted.
+count
+3
+(1 row)
+1 row inserted.
+ID | NAME    | SALARY
+9  | Barbara | NULL
+(1 row)

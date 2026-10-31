@@ -1,0 +1,23 @@
+table ACCT created.
+1 row inserted.
+1 row inserted.
+begin.
+1 row updated.
+1 row updated.
+ID | BALANCE
+1  | 60
+2  | 90
+(2 rows)
+rollback.
+ID | BALANCE
+1  | 100
+2  | 50
+(2 rows)
+begin.
+1 row updated.
+1 row updated.
+commit.
+ID | BALANCE
+1  | 60
+2  | 90
+(2 rows)

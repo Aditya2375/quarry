@@ -1,0 +1,23 @@
+table T created.
+1 row inserted.
+ERROR: duplicate primary key 1
+ERROR: column V is TEXT but value is an integer
+ERROR: table T has 2 columns, got 3 values
+ERROR: no table named MISSING
+ERROR: no column named NOPE
+ERROR: no table named MISSING
+ERROR: table T already exists
+ERROR: syntax error: PRIMARY KEY must be INT
+ERROR: type mismatch in WHERE on column V
+begin.
+ERROR: already inside a transaction
+1 row inserted.
+commit.
+ERROR: no transaction to commit
+ERROR: no transaction to roll back
+ID | V
+1  | a
+5  | five
+(2 rows)
+ERROR: syntax error: expected CREATE, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT or ROLLBACK
+ERROR: syntax error: expected a name

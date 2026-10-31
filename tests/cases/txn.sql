@@ -1,0 +1,14 @@
+CREATE TABLE acct (id INT PRIMARY KEY, balance INT);
+INSERT INTO acct VALUES (1, 100);
+INSERT INTO acct VALUES (2, 50);
+BEGIN;
+UPDATE acct SET balance = 60 WHERE id = 1;
+UPDATE acct SET balance = 90 WHERE id = 2;
+SELECT * FROM acct ORDER BY id;
+ROLLBACK;
+SELECT * FROM acct ORDER BY id;
+BEGIN;
+UPDATE acct SET balance = 60 WHERE id = 1;
+UPDATE acct SET balance = 90 WHERE id = 2;
+COMMIT;
+SELECT * FROM acct ORDER BY id;
