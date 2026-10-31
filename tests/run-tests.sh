@@ -610,6 +610,49 @@ case "$out" in
   *) echo "FAIL: R6 F1 manual reset: [$out]"; fails=$((fails + 1));;
 esac
 
+# R7: empty main + WAL whose committed frames are all corrupt (bit-rot):
+# refuse, and leave the WAL byte-identical - never reinitialize over it
+rm -f "$T/r7f1.qry" "$T/r7f1.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (42);\n.crash\n" | "$BIN" "$T/r7f1.qry" >/dev/null 2>&1 || true
+truncate -s 0 "$T/r7f1.qry"
+python3 -c "
+d = open('$T/r7f1.qry.wal', 'r+b'); d.seek(16 + 4); b = d.read(1)[0]
+d.seek(16 + 4); d.write(bytes([b ^ 0xFF])); d.close()"
+m1=$(md5sum "$T/r7f1.qry.wal" | cut -d' ' -f1)
+out=$(printf ".tables\n" | "$BIN" "$T/r7f1.qry" 2>&1 || true)
+m2=$(md5sum "$T/r7f1.qry.wal" | cut -d' ' -f1)
+case "$out" in
+  *"no recoverable committed data"*) : ;;
+  *) echo "FAIL: R7 bit-rot: [$out]"; fails=$((fails + 1));;
+esac
+[ "$m1" = "$m2" ] || { echo "FAIL: R7 bit-rot WAL modified"; fails=$((fails + 1)); }
+[ "$m1" = "$m2" ] && echo "ok: bit-rotted WAL refused, bytes preserved"
+
+# R7: torn WAL header + empty main file refuses like any other bad WAL
+rm -f "$T/r7torn.qry" "$T/r7torn.qry.wal"
+touch "$T/r7torn.qry"; printf 'ABCDEFGH' > "$T/r7torn.qry.wal"
+out=$(printf ".tables\n" | "$BIN" "$T/r7torn.qry" 2>&1 || true)
+case "$out" in
+  *"WAL header is torn"*) echo "ok: torn WAL header refused with an empty main file";;
+  *) echo "FAIL: R7 torn header: [$out]"; fails=$((fails + 1));;
+esac
+[ "$(stat -c %s "$T/r7torn.qry.wal")" = "8" ] || { echo "FAIL: R7 torn WAL modified"; fails=$((fails + 1)); }
+
+# R7: a refused open does not even trim garbage trailing the last commit
+rm -f "$T/r7tail.qry" "$T/r7tail.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\n.checkpoint\nINSERT INTO t VALUES (2);\n.crash\n" | "$BIN" "$T/r7tail.qry" >/dev/null 2>&1 || true
+truncate -s 0 "$T/r7tail.qry"
+printf 'GARBAGEGARBAGE' >> "$T/r7tail.qry.wal"
+m1=$(md5sum "$T/r7tail.qry.wal" | cut -d' ' -f1)
+out=$(printf ".tables\n" | "$BIN" "$T/r7tail.qry" 2>&1 || true)
+m2=$(md5sum "$T/r7tail.qry.wal" | cut -d' ' -f1)
+case "$out" in
+  *"refusing to destroy"*) : ;;
+  *) echo "FAIL: R7 garbage tail: [$out]"; fails=$((fails + 1));;
+esac
+if [ "$m1" = "$m2" ]; then echo "ok: refused open leaves garbage tail intact"
+else echo "FAIL: R7 garbage tail trimmed on refused open"; fails=$((fails + 1)); fi
+
 # R6 F2: a second process is refused with an honest lock error
 rm -f "$T/r6f2.qry" "$T/r6f2.qry.wal" "$T/r6f2.fifo"
 mkfifo "$T/r6f2.fifo"

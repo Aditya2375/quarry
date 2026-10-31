@@ -207,17 +207,18 @@ static int walmap_put(struct pager *p, uint32_t pgno, uint64_t off) {
 }
 
 /* ---------- open / recover ---------- */
-static int wal_recover(struct pager *p) {
+static int wal_recover(struct pager *p, int truncate_tail) {
     uint8_t hdr[16];
     ssize_t hr = read_full(p->wal_fd, hdr, sizeof hdr, 0);
+    if (hr > 0 && hr < (ssize_t)sizeof hdr)
+        return set_err(Q_ERR_CORRUPT, "WAL header is torn - not truncating it away");
     if (hr > 0 && get32(hdr) != WAL_MAGIC)
         /* a non-empty WAL we do not recognize may hold committed data
            (older format, torn header). Never erase it: fail the open. */
         return set_err(Q_ERR_CORRUPT, "WAL has an unknown format - not truncating it away");
     if (hr < (ssize_t)sizeof hdr) {
-        /* a truly empty WAL is initialized; anything else already failed
+        /* a truly empty WAL is initialized; a short one already failed
            above with a corrupt error */
-        if (hr != 0) return set_err(Q_ERR_CORRUPT, "WAL header is torn - not truncating it away");
         uint8_t wh[16] = {0};
         put32(wh, WAL_MAGIC);
         if (write_full(p->wal_fd, wh, sizeof wh, 0) < 0)
@@ -268,7 +269,7 @@ static int wal_recover(struct pager *p) {
        - must not survive open: future commits would append behind it and
        recovery would never reach them. This also removes a partial tail a
        failed commit could not truncate away itself. */
-    if (ftruncate(p->wal_fd, (off_t)last_commit_end) != 0)
+    if (truncate_tail && ftruncate(p->wal_fd, (off_t)last_commit_end) != 0)
         return set_err(Q_ERR_IO, "WAL tail truncate failed");
     return Q_OK;
 }
@@ -317,41 +318,10 @@ int pager_open(struct pager **out, const char *path) {
     int replayed = 0;
     if (sz == 0) {
         off_t wsz = lseek(p->wal_fd, 0, SEEK_END);
-        if (wsz > 16) {
-            /* The main file is empty but the WAL holds frames: the file was
-               lost or truncated outside quarry. Never discard that WAL
-               unseen - it may hold the only copy of committed data. Recover
-               the committed frames; a replay works only when the WAL also
-               carries the catalog page (page 0), otherwise refuse and leave
-               both files untouched for manual recovery. */
-            p->page_count = 1;
-            int rrc = wal_recover(p);
-            if (rrc != Q_OK) { rc = rrc; goto fail; }
-            uint64_t woff;
-            if (p->wm.n == 0) {
-                /* no valid committed frames: nothing to save, start fresh */
-                goto fresh;
-            }
-            if (!walmap_find(p, 0, &woff)) {
-                rc = set_err(Q_ERR_CORRUPT,
-                    "database file is empty but the WAL holds committed data without its catalog page - refusing to destroy it; restore a backup or remove the .wal file to start over");
-                goto fail;
-            }
-            put32(hdr + H_MAGIC, DB_MAGIC);
-            put32(hdr + H_PAGES, 1);
-            put32(hdr + H_CATROOT, 0);
-            put64le(hdr + H_CATSEQ, 1);
-            if (write_full(p->fd, hdr, Q_PAGE_SIZE, 0) < 0) {
-                rc = set_err(Q_ERR_IO, "cannot initialize database file"); goto fail;
-            }
-            /* the checkpoint folds the real page 0 from the WAL over these
-               placeholder H_* fields */
-            int crc = pager_checkpoint(p);
-            if (crc != Q_OK) { rc = crc; goto fail; }
-            p->pending_count = p->page_count;
-            replayed = 1;
-        } else {
-fresh:;
+        uint8_t whdr[16] = {0};
+        ssize_t hr = wsz == 16 ? read_full(p->wal_fd, whdr, sizeof whdr, 0) : 0;
+        if (wsz == 0 || (hr == (ssize_t)sizeof whdr && get32(whdr) == WAL_MAGIC)) {
+            /* fresh or cleanly checkpointed WAL: no frames to lose */
             put32(hdr + H_MAGIC, DB_MAGIC);
             put32(hdr + H_PAGES, 1);
             put32(hdr + H_CATROOT, 0);
@@ -371,6 +341,41 @@ fresh:;
             if (write_full(p->wal_fd, wh, sizeof wh, 0) < 0) {
                 rc = set_err(Q_ERR_IO, "WAL header write failed"); goto fail;
             }
+        } else {
+            /* The main file is empty but the WAL holds bytes that are not a
+               bare valid header: the file was lost or truncated outside
+               quarry. Never discard that WAL unseen - it may hold the only
+               copy of committed data. Recover the committed frames WITHOUT
+               touching the WAL, so a refusal below leaves both files exactly
+               as found; a replay works only when the WAL also carries the
+               catalog page (page 0), otherwise refuse for manual recovery. */
+            p->page_count = 1;
+            int rrc = wal_recover(p, 0);
+            if (rrc != Q_OK) { rc = rrc; goto fail; }
+            uint64_t woff;
+            if (p->wm.n == 0) {
+                rc = set_err(Q_ERR_CORRUPT,
+                    "database file is empty and the WAL holds no recoverable committed data - refusing to destroy it; restore a backup or remove the .wal file to start over");
+                goto fail;
+            }
+            if (!walmap_find(p, 0, &woff)) {
+                rc = set_err(Q_ERR_CORRUPT,
+                    "database file is empty but the WAL holds committed data without its catalog page - refusing to destroy it; restore a backup or remove the .wal file to start over");
+                goto fail;
+            }
+            put32(hdr + H_MAGIC, DB_MAGIC);
+            put32(hdr + H_PAGES, 1);
+            put32(hdr + H_CATROOT, 0);
+            put64le(hdr + H_CATSEQ, 1);
+            if (write_full(p->fd, hdr, Q_PAGE_SIZE, 0) < 0) {
+                rc = set_err(Q_ERR_IO, "cannot initialize database file"); goto fail;
+            }
+            /* the checkpoint folds the real page 0 from the WAL over these
+               placeholder H_* fields */
+            int crc = pager_checkpoint(p);
+            if (crc != Q_OK) { rc = crc; goto fail; }
+            p->pending_count = p->page_count;
+            replayed = 1;
         }
     } else if (sz < Q_PAGE_SIZE || read_full(p->fd, hdr, Q_PAGE_SIZE, 0) != Q_PAGE_SIZE
                || get32(hdr + H_MAGIC) != DB_MAGIC) {
@@ -379,7 +384,7 @@ fresh:;
     if (!replayed) {
         p->page_count = get32(hdr + H_PAGES);
         p->pending_count = p->page_count;
-        if (wal_recover(p) != Q_OK) { rc = Q_ERR_CORRUPT; goto fail; }
+        if (wal_recover(p, 1) != Q_OK) { rc = Q_ERR_CORRUPT; goto fail; }
         p->pending_count = p->page_count;
     }
     /* test hook: fail the Nth walmap_put once (fault injection for the
@@ -464,7 +469,7 @@ int pager_commit(struct pager *p) {
                recovers everything. */
             free(p->wm.keys); free(p->wm.offs);
             p->wm.keys = NULL; p->wm.offs = NULL; p->wm.cap = p->wm.n = 0;
-            int rrc = wal_recover(p);
+            int rrc = wal_recover(p, 1);
             p->ndirty = 0;
             p->in_txn = false;
             p->sp_active = false;
