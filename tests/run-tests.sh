@@ -1026,18 +1026,65 @@ python3 tests/fuzz.py || fails=$((fails + 1))
 
 # btree/pager unit checks
 cc -std=gnu11 -O2 -g -Wall -Wextra -Werror -Isrc \
-    tests/unit/test_btree.c src/pager.c src/btree.c -o "$T/test_btree"
+    tests/unit/test_btree.c src/pager.c src/btree.c src/record.c -o "$T/test_btree"
 "$T/test_btree" || fails=$((fails + 1))
 # same model test with shrunken fanouts: reaches depth 4 with a few
 # thousand rows, exercising multi-level interior splits end to end
 cc -std=gnu11 -O2 -g -Wall -Wextra -Werror -Isrc -DQUARRY_TEST_TINY_PAGES \
-    tests/unit/test_btree.c src/pager.c src/btree.c -o "$T/test_btree_tiny"
+    tests/unit/test_btree.c src/pager.c src/btree.c src/record.c -o "$T/test_btree_tiny"
 "$T/test_btree_tiny" || fails=$((fails + 1))
 
 # differential model against sqlite3 (skip gracefully without python3+sqlite3)
 if python3 -c 'import sqlite3' 2>/dev/null; then
     python3 tests/model_test.py || fails=$((fails + 1))
 fi
+
+# round-12: a corrupted rightmost path must fail the auto-key INSERT, not
+# silently restart keys at 1 (which used to surface as "duplicate key 1")
+python3 - "$T" <<'PY'
+import os, subprocess, sys
+td, = sys.argv[1:2]
+binp = "build/quarry"
+db = os.path.join(td, "r12-maxerr.qry")
+sql = "CREATE TABLE t (id INT, v TEXT);\n" + "".join(
+    "INSERT INTO t VALUES (%d, 'row%d');\n" % (i, i) for i in range(2000))
+r = subprocess.run([binp, db], input=sql, text=True, capture_output=True)
+assert r.returncode == 0, r.stderr
+with open(db, "rb") as f:
+    data = f.read()
+iroot = None
+for pg in range(1, len(data) // 4096):
+    if data[pg * 4096] == 2:   # an interior page (with 2000 rows: the root)
+        iroot = pg * 4096
+        break
+assert iroot, "no interior page in 2000-row tree"
+with open(db, "r+b") as f:
+    f.seek(iroot + 7)          # PH_LINK: rightmost child of the root
+    f.write((0xFFFFFF00).to_bytes(4, "little"))
+r = subprocess.run([binp, db, "-c", "INSERT INTO t VALUES (2001, 'boom');"],
+                   text=True, capture_output=True, timeout=10)
+assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+assert "corrupt" in r.stderr or "out of range" in r.stderr, r.stderr
+assert "duplicate" not in r.stderr, r.stderr   # the old key=1 fallback symptom
+print("ok: btree_max errors propagate on auto-key insert")
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
+
+# round-12: two positional database paths are a usage error, not "last wins"
+python3 - "$T" <<'PY'
+import os, subprocess, sys
+td, = sys.argv[1:2]
+binp = "build/quarry"
+a = os.path.join(td, "r12-a.qry"); b = os.path.join(td, "r12-b.qry")
+r = subprocess.run([binp, a, b, "-c", "SELECT 1;"], text=True, capture_output=True)
+assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+assert "extra argument" in r.stderr, r.stderr
+# one path still works, and options can surround it
+r = subprocess.run([binp, "-c", "CREATE TABLE t (id INT);", a], text=True, capture_output=True)
+assert r.returncode == 0, r.stderr
+print("ok: extra positional database path rejected")
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
 
 if [ "$fails" -gt 0 ]; then
     echo "SUITE FAILED: $fails failing group(s)"

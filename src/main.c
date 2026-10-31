@@ -45,7 +45,7 @@ static long find_stmt_end(const char *buf) {
 }
 
 int main(int argc, char **argv) {
-    const char *path = "quarry.db";
+    const char *path = NULL;
     const char *one = NULL;
     int do_validate = 0;
     for (int i = 1; i < argc; i++) {
@@ -56,9 +56,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-validate")) { do_validate = 1; }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout); return 0; }
         else if (argv[i][0] == '-') { usage(stderr); return 2; }  /* never create a file named "-c" */
-        else path = argv[i];
+        else {
+            if (path) { fprintf(stderr, "quarry: extra argument '%s' (one database file only)\n", argv[i]); usage(stderr); return 2; }
+            path = argv[i];
+        }
     }
 
+    if (!path) path = "quarry.db";
     struct db *d = NULL;
     if (db_open(&d, path) != Q_OK) { fprintf(stderr, "error: %s\n", q_err); return 1; }
 

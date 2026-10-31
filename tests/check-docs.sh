@@ -7,7 +7,7 @@ OUT=build/docs-check
 mkdir -p "$OUT"
 
 cc -std=gnu11 -O2 -g -Wall -Wextra -Werror -Isrc \
-    tests/unit/test_btree.c src/pager.c src/btree.c -o "$OUT/test_btree"
+    tests/unit/test_btree.c src/pager.c src/btree.c src/record.c -o "$OUT/test_btree"
 REAL=$("$OUT/test_btree" | grep -o '^[0-9]* checks passed' | grep -o '^[0-9]*')
 for stated in $(grep -o '[0-9,]* pager/B+tree unit checks' README.md | grep -o '^[0-9,]*' | tr -d ','); do
     if [ "$stated" != "$REAL" ]; then

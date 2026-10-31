@@ -316,12 +316,17 @@ static int exec_insert(struct db *d, struct stmt *st) {
     if (t->cols[0].is_pk) {
         key = vals[0].i;
     } else {
-        if (btree_max(d->pg, t->root, &key) == Q_OK) {
+        int mrc = btree_max(d->pg, t->root, &key);
+        if (mrc == Q_OK) {
             if (key == INT64_MAX)
                 return fail(Q_ERR_TOO_BIG,
                             "cannot auto-assign a key: INT64_MAX already used");
             key++;
-        } else key = 1;
+        } else if (mrc == Q_ERR_SCHEMA) {
+            key = 1;   /* genuinely empty tree */
+        } else {
+            return mrc;   /* corruption / I/O: never guess a key over it */
+        }
     }
     uint32_t need = 0;
     for (int i = 0; i < t->ncols; i++)

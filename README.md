@@ -56,7 +56,7 @@ make check                    # full test suite
   scan-long cycle budget, and recovery truncates the WAL at the last valid
   commit boundary, so a corrupted file produces a clean error, not a crash
   or an infinite loop.
-- **Tested like it matters.** 2,613,079 pager/B+tree unit checks: insert /
+- **Tested like it matters.** 2,613,085 pager/B+tree unit checks: insert /
   find / scan / delete against a model with commit-close-reopen and
   crash-recovery cycles and corrupt-page rejection, plus a
   randomized-order model test that grows the tree to depth 3 with wide

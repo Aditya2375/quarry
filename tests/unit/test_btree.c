@@ -324,7 +324,30 @@ static void model_and_corruption(void) {
 
 #endif
 
+/* round-12: row_decode rejects trailing bytes and truncations */
+static void record_decode_edges(void) {
+    struct tabledef t; memset(&t, 0, sizeof t);
+    t.ncols = 3;
+    t.cols[0].type = Q_COL_INT;
+    t.cols[1].type = Q_COL_TEXT;
+    t.cols[2].type = Q_COL_INT;
+    struct qval in[3]; memset(in, 0, sizeof in);
+    struct qval out[3];
+    in[0].type = Q_COL_INT; in[0].i = 42;
+    in[1].type = Q_COL_TEXT; in[1].s = "hello"; in[1].slen = 5;
+    in[2].type = 0;   /* NULL */
+    uint8_t buf[128];
+    uint32_t len = row_encode(&t, in, buf);
+    CHECK(row_decode(&t, buf, len, out) == Q_OK);
+    CHECK(out[0].i == 42);
+    CHECK(out[1].slen == 5 && memcmp(out[1].s, "hello", 5) == 0);
+    CHECK(out[2].type == 0);
+    CHECK(row_decode(&t, buf, len + 1, out) == Q_ERR_CORRUPT);  /* trailing byte */
+    CHECK(row_decode(&t, buf, len - 1, out) == Q_ERR_CORRUPT);  /* truncated */
+}
+
 int main(void) {
+    record_decode_edges();
 #ifdef QUARRY_TEST_TINY_PAGES
     /* shrunken fanouts: depth-4 trees with a few thousand rows */
     randomized_model(4242, 2, 4000, 8, 3, 500, 4);

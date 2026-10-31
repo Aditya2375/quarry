@@ -60,5 +60,9 @@ int row_decode(const struct tabledef *t, const uint8_t *buf, uint32_t len, struc
             return Q_ERR_CORRUPT;
         }
     }
+    if (r != len) {
+        snprintf(q_err, sizeof q_err, "corrupt row: %u trailing bytes", len - r);
+        return Q_ERR_CORRUPT;
+    }
     return Q_OK;
 }
