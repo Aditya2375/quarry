@@ -39,19 +39,31 @@ make check                    # full test suite
 - **SQL subset.** `CREATE TABLE` (INT / TEXT columns, one optional INT
   `PRIMARY KEY`), `INSERT` (positional or named columns), `SELECT` with
   `WHERE` (ANDed `= != < <= > >=`), `ORDER BY`, `LIMIT`, `COUNT(*)`,
-  `UPDATE`, `DELETE`. NULLs supported.
-- **Tested like it matters.** 38,362 pager/B+tree unit checks (insert /
+  `UPDATE`, `DELETE`. NULLs supported with SQL three-valued logic:
+  a `WHERE` comparison that touches NULL never matches the row.
+- **Every statement is atomic.** A failed statement inside an explicit
+  transaction undoes only its own pages; the transaction stays open.
+  A failed `COMMIT` (disk full, I/O error) leaves no trace: partial WAL
+  frames are truncated away and the transaction can still be rolled back.
+- **Corruption is contained.** Every B+tree page is validated when read
+  (type, cell counts, cell bounds), so a corrupted file produces a clean
+  error, not a crash or an infinite loop.
+- **Tested like it matters.** 38,395 pager/B+tree unit checks (insert /
   find / scan / delete against a model, with commit-close-reopen and
-  crash-recovery cycles), scripted CRUD / transaction / error cases, a
-  20,000-row stress run that forces interior splits, and a differential
-  test that runs random workloads against SQLite and compares the full
-  table contents. The whole suite also runs under ASan + UBSan in CI, and
-  300 rounds of garbage-input fuzzing produce no crash.
+  crash-recovery cycles, plus corrupt-page rejection), scripted CRUD /
+  transaction / error / NULL-semantics cases, a 20,000-row stress run
+  that forces interior splits, fault injection that fails a commit
+  mid-WAL-write via `RLIMIT_FSIZE`, and a differential test that runs
+  random workloads against SQLite and compares the full table contents.
+  The whole suite also runs under ASan + UBSan in CI, and the shipped
+  fuzzer (`tests/fuzz.py`) throws 300 rounds of garbage SQL and 200
+  rounds of on-disk corruption per run with no crash and no hang.
 
 ## Honest limits
 
 - No joins, no secondary indexes - every query is a full scan of one
-  table; `ORDER BY` sorts the matching rows in memory (capped at 100,000).
+  table. The matching rows of any statement are collected in memory
+  (capped at 100,000); `ORDER BY` sorts that set before printing.
 - A transaction's dirty pages are buffered in memory (bounded at 2048
   pages / 8 MB per transaction); a bigger transaction gets a clean error,
   not corruption.

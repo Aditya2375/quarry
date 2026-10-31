@@ -35,6 +35,7 @@ struct parser {
     struct tok t;
     char *owned[Q_MAX_COLS + 8];  /* strings to free on error */
     int nowned;
+    bool num_overflow;            /* last T_NUM did not fit in int64 */
 };
 
 static void tok_free(struct tok *t) {
@@ -71,9 +72,19 @@ static void next(struct parser *ps) {
         ps->t.kind = T_NUM;
         bool neg = *c == '-';
         if (neg) c++;
-        int64_t v = 0;
-        while (isdigit((unsigned char)*c)) { v = v * 10 + (*c - '0'); c++; }
-        ps->t.num = neg ? -v : v;
+        /* checked accumulation: no signed overflow on huge literals,
+           and -9223372036854775808 (INT64_MIN) parses correctly */
+        uint64_t lim = neg ? (uint64_t)INT64_MAX + 1 : (uint64_t)INT64_MAX;
+        uint64_t u = 0;
+        ps->num_overflow = false;
+        while (isdigit((unsigned char)*c)) {
+            uint64_t dgt = (uint64_t)(*c - '0');
+            if (u > (lim - dgt) / 10) ps->num_overflow = true;
+            else u = u * 10 + dgt;
+            c++;
+        }
+        ps->t.num = neg ? (u == (uint64_t)INT64_MAX + 1 ? INT64_MIN : -(int64_t)u)
+                        : (int64_t)u;
     } else if (*c == '\'') {
         c++;
         size_t cap = 32, n = 0;
@@ -132,6 +143,7 @@ static void own(struct parser *ps, char *s) {
 
 static int literal(struct parser *ps, struct qval *v, char **owned) {
     if (ps->t.kind == T_NUM) {
+        if (ps->num_overflow) return fail(ps, "integer literal out of range");
         v->type = Q_COL_INT; v->i = ps->t.num;
         *owned = NULL;
         next(ps); return Q_OK;
@@ -312,7 +324,8 @@ static int parse_tail(struct parser *ps, struct stmt *st) {
     }
     if (kw(ps, "LIMIT")) {
         next(ps);
-        if (ps->t.kind != T_NUM || ps->t.num < 0) return fail(ps, "LIMIT needs a non-negative integer");
+        if (ps->t.kind != T_NUM || ps->num_overflow || ps->t.num < 0)
+            return fail(ps, "LIMIT needs a non-negative integer");
         st->limit = ps->t.num;
         st->has_limit = true;
         next(ps);
@@ -344,7 +357,14 @@ int sql_parse(const char *text, struct stmt *st) {
     else if (kw(&ps, "COMMIT")) { st->kind = S_COMMIT; next(&ps); rc = Q_OK; }
     else if (kw(&ps, "ROLLBACK")) { st->kind = S_ROLLBACK; next(&ps); rc = Q_OK; }
     else return fail(&ps, "expected CREATE, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT or ROLLBACK");
-    if (rc == Q_OK) rc = parse_tail(&ps, st);
+    if (rc == Q_OK) {
+        if (st->kind == S_BEGIN || st->kind == S_COMMIT || st->kind == S_ROLLBACK) {
+            if (ps.t.kind == T_PUNCT && ps.t.ch == ';') next(&ps);
+            if (ps.t.kind != T_END) rc = fail(&ps, "unexpected input after transaction statement");
+        } else {
+            rc = parse_tail(&ps, st);
+        }
+    }
     if (rc != Q_OK) stmt_free(st);
     tok_free(&ps.t);
     return rc;

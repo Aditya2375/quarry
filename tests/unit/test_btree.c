@@ -147,6 +147,69 @@ int main(void) {
     }
     CHECK(pager_close(p) == Q_OK);
 
+    /* --- corruption guards --- */
+    const char *cpath = "/tmp/quarry-unit-corrupt.qry";
+    unlink(cpath);
+    unlink("/tmp/quarry-unit-corrupt.qry.wal");
+    CHECK(pager_open(&p, cpath) == Q_OK);
+    CHECK(pager_begin(p) == Q_OK);
+    CHECK(btree_create(p, &root) == Q_OK);
+    memcpy(rec, &keys[0], 8);
+    for (int i = 0; i < 5; i++) CHECK(btree_insert(p, &root, keys[i], rec, 8) == Q_OK);
+    CHECK(pager_commit(p) == Q_OK);
+
+    /* a leaf with ncells = 0xFFFF must be rejected, not walked */
+    uint8_t *mp;
+    CHECK(pager_begin(p) == Q_OK);
+    CHECK(pager_get_mut(p, root, &mp) == Q_OK);
+    mp[0] = 1;                    /* leaf */
+    mp[1] = 0xFF; mp[2] = 0xFF;   /* ncells */
+    CHECK(pager_commit(p) == Q_OK);
+    { uint8_t o[16]; uint32_t l = sizeof o;
+      CHECK(btree_find(p, root, keys[0], o, &l) == Q_ERR_CORRUPT); }
+    { int64_t mx; CHECK(btree_max(p, root, &mx) == Q_ERR_CORRUPT); }
+    { struct cursor c; CHECK(cursor_first(p, root, &c) == Q_ERR_CORRUPT); }
+    CHECK(pager_begin(p) == Q_OK);
+    { int64_t k = 424242; memcpy(rec, &k, 8);
+      uint32_t r2 = root;
+      CHECK(btree_insert(p, &r2, k, rec, 8) == Q_ERR_CORRUPT); }
+    CHECK(pager_rollback(p) == Q_OK);
+
+    /* an unknown page type must be rejected */
+    CHECK(pager_begin(p) == Q_OK);
+    CHECK(pager_get_mut(p, root, &mp) == Q_OK);
+    memset(mp, 0, 128);
+    mp[0] = 0x7F;
+    CHECK(pager_commit(p) == Q_OK);
+    { uint8_t o[16]; uint32_t l = sizeof o;
+      CHECK(btree_find(p, root, keys[0], o, &l) == Q_ERR_CORRUPT); }
+
+    /* an interior page pointing at itself must error, not loop */
+    CHECK(pager_begin(p) == Q_OK);
+    CHECK(pager_get_mut(p, root, &mp) == Q_OK);
+    memset(mp, 0, 64);
+    mp[0] = 2;                             /* interior */
+    mp[1] = 1; mp[2] = 0;                  /* one cell */
+    memcpy(mp + 16 + 8, &root, 4);         /* child = itself */
+    CHECK(pager_commit(p) == Q_OK);
+    { uint8_t o[16]; uint32_t l = sizeof o;
+      CHECK(btree_find(p, root, keys[0], o, &l) == Q_ERR_CORRUPT); }
+    { struct cursor c; CHECK(cursor_first(p, root, &c) == Q_ERR_CORRUPT); }
+    { int64_t mx; CHECK(btree_max(p, root, &mx) == Q_ERR_CORRUPT); }
+
+    /* interior cell count beyond the page must be rejected */
+    CHECK(pager_begin(p) == Q_OK);
+    CHECK(pager_get_mut(p, root, &mp) == Q_OK);
+    memset(mp, 0, 64);
+    mp[0] = 2;
+    mp[1] = 0xFF; mp[2] = 0xFF;
+    CHECK(pager_commit(p) == Q_OK);
+    { struct cursor c; CHECK(cursor_first(p, root, &c) == Q_ERR_CORRUPT); }
+
+    CHECK(pager_close(p) == Q_OK);
+    unlink(cpath);
+    unlink("/tmp/quarry-unit-corrupt.qry.wal");
+
     printf("%ld checks passed\n", checks);
     return 0;
 }

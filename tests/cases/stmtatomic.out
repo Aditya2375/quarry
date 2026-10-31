@@ -1,0 +1,33 @@
+table T created.
+1 row inserted.
+1 row inserted.
+begin.
+ERROR: duplicate key 2
+ID | V
+1  | one
+2  | two
+(2 rows)
+ERROR: duplicate primary key 2
+count
+2
+(1 row)
+commit.
+ID | V
+1  | one
+2  | two
+(2 rows)
+begin.
+table U created.
+ERROR: table U already exists
+T
+U
+commit.
+begin.
+1 row deleted.
+1 row updated.
+1 row updated.
+rollback.
+ID | V
+1  | one
+2  | two
+(2 rows)

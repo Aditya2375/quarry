@@ -19,3 +19,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: ./tests/check-docs.sh
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: "6.0.13"
+          actions-cache-folder: emsdk-cache
+      - run: sh wasm/build.sh
+      - name: committed demo artifacts must match a fresh build
+        run: git diff --exit-code --stat docs/

@@ -1,0 +1,14 @@
+table T created.
+1 row inserted.
+ERROR: ORDER BY and LIMIT are not supported with COUNT(*)
+ERROR: ORDER BY and LIMIT are not supported with COUNT(*)
+ERROR: syntax error: unexpected input after transaction statement
+ERROR: syntax error: unexpected input after transaction statement
+ERROR: syntax error: unexpected input after transaction statement
+ERROR: syntax error: integer literal out of range
+ERROR: syntax error: integer literal out of range
+1 row inserted.
+ID                   | V
+-9223372036854775808 | min
+(1 row)
+ERROR: syntax error: LIMIT needs a non-negative integer

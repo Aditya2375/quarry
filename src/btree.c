@@ -45,6 +45,47 @@ static int64_t g64(const uint8_t *b) {
 
 static int oom(void) { snprintf(q_err, sizeof q_err, "out of memory"); return Q_ERR_NOMEM; }
 
+/* ---------- corruption guards ---------- */
+#define MAX_DEPTH 64   /* a real tree over 32-bit pages is far shallower */
+
+static int corrupt(const char *what) {
+    snprintf(q_err, sizeof q_err, "corrupt database: %s", what);
+    return Q_ERR_CORRUPT;
+}
+
+/* header sanity + cell-area bounds, checked on every page read so a
+   corrupted file errors out instead of walking out of bounds or looping */
+static int page_check(const uint8_t *pg) {
+    if (pg[PH_TYPE] != PT_LEAF && pg[PH_TYPE] != PT_INTERIOR)
+        return corrupt("unknown page type");
+    uint32_t n = g16(pg + PH_NCELLS);
+    if (pg[PH_TYPE] == PT_INTERIOR) {
+        if (n > (Q_PAGE_SIZE - PH_SIZE) / INT_CELL_SIZE)
+            return corrupt("interior cell count out of range");
+    } else {
+        uint32_t off = PH_SIZE;
+        for (uint32_t i = 0; i < n; i++) {
+            if (off + LEAF_CELL_HDR > Q_PAGE_SIZE)
+                return corrupt("leaf cell header out of bounds");
+            off += LEAF_CELL_HDR + g16(pg + off + 8);
+            if (off > Q_PAGE_SIZE)
+                return corrupt("leaf cell payload out of bounds");
+        }
+    }
+    return Q_OK;
+}
+
+static int get_checked(struct pager *p, uint32_t pgno, const uint8_t **pg) {
+    int rc = pager_get(p, pgno, pg);
+    if (rc != Q_OK) return rc;
+    return page_check(*pg);
+}
+static int get_mut_checked(struct pager *p, uint32_t pgno, uint8_t **pg) {
+    int rc = pager_get_mut(p, pgno, pg);
+    if (rc != Q_OK) return rc;
+    return page_check(*pg);
+}
+
 /* ---------- leaf helpers ---------- */
 /* byte offset of cell i by walking the packed area */
 static uint32_t leaf_cell_off(const uint8_t *pg, int i) {
@@ -92,6 +133,10 @@ static void int_insert_cell_at(uint8_t *pg, int pos, int64_t key, uint32_t child
 }
 
 /* ---------- public API ---------- */
+int cursor_first(struct pager *p, uint32_t root, struct cursor *c);
+int cursor_next(struct cursor *c);
+int cursor_get(struct cursor *c, int64_t *key, uint8_t *buf, uint32_t *len_io);
+
 int btree_create(struct pager *p, uint32_t *root_out) {
     uint32_t pgno; uint8_t *pg;
     int rc = pager_alloc(p, &pgno, &pg);
@@ -104,14 +149,17 @@ int btree_create(struct pager *p, uint32_t *root_out) {
 
 static uint32_t find_leaf(struct pager *p, uint32_t root, int64_t key, int *rc) {
     uint32_t pgno = root;
-    for (;;) {
+    for (int depth = 0; depth < MAX_DEPTH; depth++) {
         const uint8_t *pg;
-        *rc = pager_get(p, pgno, &pg);
+        *rc = get_checked(p, pgno, &pg);
         if (*rc != Q_OK) return 0;
         if (pg[PH_TYPE] == PT_LEAF) return pgno;
         uint32_t next = int_child_for(pg, key);
+        if (next == pgno) { *rc = corrupt("interior page points at itself"); return 0; }
         pgno = next;
     }
+    *rc = corrupt("tree deeper than 64 levels");
+    return 0;
 }
 
 int btree_find(struct pager *p, uint32_t root, int64_t key, uint8_t *buf, uint32_t *len_io) {
@@ -119,7 +167,7 @@ int btree_find(struct pager *p, uint32_t root, int64_t key, uint8_t *buf, uint32
     uint32_t leaf = find_leaf(p, root, key, &rc);
     if (rc != Q_OK) return rc;
     const uint8_t *pg;
-    if ((rc = pager_get(p, leaf, &pg)) != Q_OK) return rc;
+    if ((rc = get_checked(p, leaf, &pg)) != Q_OK) return rc;
     int n = g16(pg + PH_NCELLS);
     int i = leaf_lower_bound(pg, key);
     if (i < n) {
@@ -140,21 +188,38 @@ int btree_find(struct pager *p, uint32_t root, int64_t key, uint8_t *buf, uint32
 
 int btree_max(struct pager *p, uint32_t root, int64_t *key_out) {
     uint32_t pgno = root;
-    for (;;) {
+    for (int depth = 0; depth < MAX_DEPTH; depth++) {
         const uint8_t *pg;
-        int rc = pager_get(p, pgno, &pg);
+        int rc = get_checked(p, pgno, &pg);
         if (rc != Q_OK) return rc;
-        if (pg[PH_TYPE] == PT_INTERIOR) { pgno = g32(pg + PH_LINK); continue; }
-        int n = g16(pg + PH_NCELLS);
-        if (n == 0) {
+        if (pg[PH_TYPE] == PT_INTERIOR) {
             uint32_t next = g32(pg + PH_LINK);
-            if (next == 0) { snprintf(q_err, sizeof q_err, "empty tree"); return Q_ERR_SCHEMA; }
-            pgno = next;   /* skip an emptied leaf */
+            if (next == pgno) return corrupt("interior page points at itself");
+            pgno = next;
             continue;
         }
-        *key_out = g64(pg + leaf_cell_off(pg, n - 1));
+        int n = g16(pg + PH_NCELLS);
+        if (n > 0) {
+            *key_out = g64(pg + leaf_cell_off(pg, n - 1));
+            return Q_OK;
+        }
+        /* The rightmost leaf is empty (every row in it was deleted; leaves
+           are never merged). There is no right sibling to follow, so scan
+           the tree for the last remaining key instead of giving up. */
+        struct cursor c;
+        rc = cursor_first(p, root, &c);
+        if (rc != Q_OK) return rc;
+        if (c.done) { snprintf(q_err, sizeof q_err, "empty tree"); return Q_ERR_SCHEMA; }
+        int64_t mx = 0;
+        while (!c.done) {
+            uint32_t l = 0;
+            if ((rc = cursor_get(&c, &mx, NULL, &l)) != Q_OK) return rc;
+            if ((rc = cursor_next(&c)) != Q_OK) return rc;
+        }
+        *key_out = mx;
         return Q_OK;
     }
+    return corrupt("tree deeper than 64 levels");
 }
 
 struct promo { int valid; int64_t key; uint32_t child; };
@@ -162,7 +227,7 @@ struct promo { int valid; int64_t key; uint32_t child; };
 static int insert_rec(struct pager *p, uint32_t pgno, int64_t key,
                       const uint8_t *data, uint32_t len, struct promo *pr) {
     uint8_t *pg;
-    int rc = pager_get_mut(p, pgno, &pg);
+    int rc = get_mut_checked(p, pgno, &pg);
     if (rc != Q_OK) return rc;
     pr->valid = 0;
 
@@ -363,7 +428,7 @@ int btree_delete(struct pager *p, uint32_t root, int64_t key) {
     uint32_t leaf = find_leaf(p, root, key, &rc);
     if (rc != Q_OK) return rc;
     uint8_t *pg;
-    if ((rc = pager_get_mut(p, leaf, &pg)) != Q_OK) return rc;
+    if ((rc = get_mut_checked(p, leaf, &pg)) != Q_OK) return rc;
     int n = g16(pg + PH_NCELLS);
     int i = leaf_lower_bound(pg, key);
     if (i >= n) return Q_OK;             /* absent: nothing to do */
@@ -381,23 +446,26 @@ int btree_delete(struct pager *p, uint32_t root, int64_t key) {
 int cursor_first(struct pager *p, uint32_t root, struct cursor *c) {
     c->p = p; c->done = 0; c->idx = 0;
     uint32_t pgno = root;
-    for (;;) {
+    for (int depth = 0; depth < MAX_DEPTH; depth++) {
         const uint8_t *pg;
-        int rc = pager_get(p, pgno, &pg);
+        int rc = get_checked(p, pgno, &pg);
         if (rc != Q_OK) return rc;
         if (pg[PH_TYPE] == PT_LEAF) break;
         int n = g16(pg + PH_NCELLS);
         pgno = (n > 0) ? g32(pg + int_cell_off(0) + 8) : g32(pg + PH_LINK);
+        if (depth + 1 == MAX_DEPTH) return corrupt("tree deeper than 64 levels");
     }
     c->leaf = pgno;
-    /* skip leading empty leaves */
+    /* skip leading empty leaves; a corrupt sibling cycle must not loop */
+    uint32_t steps = 0, limit = pager_page_count(p) + 1;
     for (;;) {
         const uint8_t *pg;
-        int rc = pager_get(p, c->leaf, &pg);
+        int rc = get_checked(p, c->leaf, &pg);
         if (rc != Q_OK) return rc;
         if (g16(pg + PH_NCELLS) > 0) return Q_OK;
         uint32_t next = g32(pg + PH_LINK);
         if (next == 0) { c->done = 1; return Q_OK; }
+        if (++steps > limit) return corrupt("leaf sibling chain loops");
         c->leaf = next;
     }
 }
@@ -405,16 +473,18 @@ int cursor_first(struct pager *p, uint32_t root, struct cursor *c) {
 int cursor_next(struct cursor *c) {
     if (c->done) return Q_OK;
     const uint8_t *pg;
-    int rc = pager_get(c->p, c->leaf, &pg);
+    int rc = get_checked(c->p, c->leaf, &pg);
     if (rc != Q_OK) return rc;
     c->idx++;
+    uint32_t steps = 0, limit = pager_page_count(c->p) + 1;
     for (;;) {
         if (c->idx < g16(pg + PH_NCELLS)) return Q_OK;
         uint32_t next = g32(pg + PH_LINK);
         if (next == 0) { c->done = 1; return Q_OK; }
         c->leaf = next;
         c->idx = 0;
-        rc = pager_get(c->p, c->leaf, &pg);
+        if (++steps > limit) return corrupt("leaf sibling chain loops");
+        rc = get_checked(c->p, c->leaf, &pg);
         if (rc != Q_OK) return rc;
     }
 }
@@ -422,7 +492,7 @@ int cursor_next(struct cursor *c) {
 int cursor_get(struct cursor *c, int64_t *key, uint8_t *buf, uint32_t *len_io) {
     if (c->done) { snprintf(q_err, sizeof q_err, "cursor exhausted"); return Q_ERR_SCHEMA; }
     const uint8_t *pg;
-    int rc = pager_get(c->p, c->leaf, &pg);
+    int rc = get_checked(c->p, c->leaf, &pg);
     if (rc != Q_OK) return rc;
     uint32_t off = leaf_cell_off(pg, c->idx);
     uint16_t len = g16(pg + off + 8);

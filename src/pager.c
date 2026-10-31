@@ -223,20 +223,35 @@ static int wal_recover(struct pager *p) {
     return Q_OK;
 }
 
+static void fsync_dir(const char *path) {
+    /* make a newly created file's directory entry durable */
+    char *dup = strdup(path);
+    if (!dup) return;
+    char *slash = strrchr(dup, '/');
+    if (slash) { *slash = 0; if (!dup[0]) strcpy(dup, "/"); }
+    else strcpy(dup, ".");
+    int dfd = open(dup, O_RDONLY);
+    if (dfd >= 0) { fsync(dfd); close(dfd); }
+    free(dup);
+}
+
 int pager_open(struct pager **out, const char *path) {
+    int rc = Q_OK;
     struct pager *p = calloc(1, sizeof *p);
     if (!p) return set_err(Q_ERR_NOMEM, "out of memory");
+    p->fd = p->wal_fd = -1;
     p->path = strdup(path);
     size_t n = strlen(path);
     p->wal_path = malloc(n + 5);
-    if (!p->path || !p->wal_path) return set_err(Q_ERR_NOMEM, "out of memory");
+    if (!p->path || !p->wal_path) { rc = set_err(Q_ERR_NOMEM, "out of memory"); goto fail; }
     memcpy(p->wal_path, path, n);
     memcpy(p->wal_path + n, ".wal", 5);
 
     p->fd = open(path, O_RDWR | O_CREAT, 0644);
-    if (p->fd < 0) return set_err(Q_ERR_IO, "cannot open database file");
+    if (p->fd < 0) { rc = set_err(Q_ERR_IO, "cannot open database file"); goto fail; }
     p->wal_fd = open(p->wal_path, O_RDWR | O_CREAT, 0644);
-    if (p->wal_fd < 0) return set_err(Q_ERR_IO, "cannot open WAL file");
+    if (p->wal_fd < 0) { rc = set_err(Q_ERR_IO, "cannot open WAL file"); goto fail; }
+    fsync_dir(path);
 
     uint8_t hdr[Q_PAGE_SIZE] = {0};
     off_t sz = lseek(p->fd, 0, SEEK_END);
@@ -255,14 +270,19 @@ int pager_open(struct pager **out, const char *path) {
         write_full(p->wal_fd, wh, sizeof wh, 0);
     } else if (sz < Q_PAGE_SIZE || read_full(p->fd, hdr, Q_PAGE_SIZE, 0) != Q_PAGE_SIZE
                || get32(hdr + H_MAGIC) != DB_MAGIC) {
-        return set_err(Q_ERR_CORRUPT, "not a quarry database (bad header)");
+        rc = set_err(Q_ERR_CORRUPT, "not a quarry database (bad header)"); goto fail;
     }
     p->page_count = get32(hdr + H_PAGES);
     p->pending_count = p->page_count;
-    if (wal_recover(p) != Q_OK) return Q_ERR_CORRUPT;
+    if (wal_recover(p) != Q_OK) { rc = Q_ERR_CORRUPT; goto fail; }
     p->pending_count = p->page_count;
     *out = p;
     return Q_OK;
+fail:
+    if (p->fd >= 0) close(p->fd);
+    if (p->wal_fd >= 0) close(p->wal_fd);
+    free(p->path); free(p->wal_path); free(p);
+    return rc;
 }
 
 /* ---------- transactions ---------- */
@@ -281,6 +301,12 @@ int pager_commit(struct pager *p) {
     if (lseek(p->wal_fd, 0, SEEK_END) < 0) return set_err(Q_ERR_IO, "WAL seek failed");
     uint64_t off = (uint64_t)lseek(p->wal_fd, 0, SEEK_CUR);
     if (off < 16) off = 16;
+    uint64_t start = off;
+    /* Stage every frame first. The walmap and page_count move only after
+       the whole batch is written and fsynced, so a failed commit (disk
+       full, quota, EIO) leaves no committed-looking frames behind: the
+       partial tail is truncated away and ROLLBACK still just drops the
+       dirty set. */
     for (size_t i = 0; i < p->ndirty; i++) {
         uint8_t fh[16];
         uint32_t last = (i + 1 == p->ndirty) ? p->pending_count : 0;
@@ -289,19 +315,51 @@ int pager_commit(struct pager *p) {
         put32(fh + 8, last);
         put32(fh + 12, crc32_of(p->dirty[i].bytes, Q_PAGE_SIZE));
         if (write_full(p->wal_fd, fh, sizeof fh, off) < 0 ||
-            write_full(p->wal_fd, p->dirty[i].bytes, Q_PAGE_SIZE, off + 16) < 0)
+            write_full(p->wal_fd, p->dirty[i].bytes, Q_PAGE_SIZE, off + 16) < 0) {
+            if (ftruncate(p->wal_fd, (off_t)start) != 0)
+                return set_err(Q_ERR_IO, "WAL write failed (partial frames may linger until the next checkpoint)");
             return set_err(Q_ERR_IO, "WAL write failed");
-        walmap_put(p, p->dirty[i].pgno, off);
+        }
+        off += 16 + Q_PAGE_SIZE;
+    }
+    if (fsync(p->wal_fd) < 0) {
+        if (ftruncate(p->wal_fd, (off_t)start) != 0)
+            return set_err(Q_ERR_IO, "WAL fsync failed (partial frames may linger until the next checkpoint)");
+        return set_err(Q_ERR_IO, "WAL fsync failed");
+    }
+    off = start;
+    for (size_t i = 0; i < p->ndirty; i++) {
+        if (walmap_put(p, p->dirty[i].pgno, off) != Q_OK) {
+            /* frames are durable; losing the in-memory map is not fatal:
+               end the txn and checkpoint right away, which rebuilds it */
+            p->page_count = p->pending_count;
+            p->ndirty = 0;
+            p->in_txn = false;
+            int rc = pager_checkpoint(p);
+            if (rc != Q_OK) return rc;
+            return Q_OK;
+        }
         off += 16 + Q_PAGE_SIZE;
         p->frames_since_ckpt++;
     }
-    if (fsync(p->wal_fd) < 0) return set_err(Q_ERR_IO, "WAL fsync failed");
     p->page_count = p->pending_count;
     p->ndirty = 0;
     p->in_txn = false;
-    /* auto-checkpoint: keep the WAL from growing without bound */
-    if (p->frames_since_ckpt >= 2000) return pager_checkpoint(p);
+    /* auto-checkpoint is best-effort: the commit is already durable, so a
+       checkpoint failure must not report the transaction as failed */
+    if (p->frames_since_ckpt >= 2000) pager_checkpoint(p);
     return Q_OK;
+}
+
+void pager_sp_mark(struct pager *p, struct pager_savepoint *sp) {
+    sp->ndirty = p->ndirty;
+    sp->pending = p->pending_count;
+}
+void pager_sp_restore(struct pager *p, const struct pager_savepoint *sp) {
+    /* every change since the mark lives only in the dirty set, so
+       truncating it restores the exact pre-statement page state */
+    p->ndirty = sp->ndirty;
+    p->pending_count = sp->pending;
 }
 
 int pager_rollback(struct pager *p) {

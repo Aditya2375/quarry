@@ -64,6 +64,11 @@ int  pager_commit(struct pager *p);
 int  pager_rollback(struct pager *p);
 bool pager_in_txn(struct pager *p);
 
+/* statement-level savepoint inside an open transaction */
+struct pager_savepoint { size_t ndirty; uint32_t pending; };
+void pager_sp_mark(struct pager *p, struct pager_savepoint *sp);
+void pager_sp_restore(struct pager *p, const struct pager_savepoint *sp);
+
 int  pager_get(struct pager *p, uint32_t pgno, const uint8_t **page);
 int  pager_get_mut(struct pager *p, uint32_t pgno, uint8_t **page);
 int  pager_alloc(struct pager *p, uint32_t *pgno, uint8_t **page);
@@ -100,6 +105,7 @@ int  db_open(struct db **out, const char *path);
 int  db_close(struct db *d);
 void db_abandon(struct db *d);
 int  db_exec(struct db *d, const char *sql);        /* one statement */
+bool db_in_txn(struct db *d);                       /* explicit BEGIN open */
 int  db_checkpoint(struct db *d);
 int  db_list_tables(struct db *d);                  /* prints via q_out */
 int  db_show_schema(struct db *d, const char *name);

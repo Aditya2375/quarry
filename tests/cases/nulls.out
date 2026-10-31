@@ -1,0 +1,21 @@
+table N created.
+1 row inserted.
+1 row inserted.
+ID
+(0 rows)
+ID
+(0 rows)
+ID
+1
+(1 row)
+count
+1
+(1 row)
+ID | V
+1  | 10
+2  | NULL
+(2 rows)
+ERROR: column ID listed twice
+count
+2
+(1 row)

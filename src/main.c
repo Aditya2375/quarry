@@ -5,7 +5,9 @@
  *
  * Statements end with ';' and may span lines. Dot commands:
  *   .tables  .schema NAME  .open FILE  .checkpoint  .crash  .exit  .help
- * (.crash kills the process without checkpointing, to prove WAL recovery)
+ * (.crash kills the process without checkpointing, to prove WAL recovery.
+ *  It simulates an OS/process crash: commits that were fsynced must survive.
+ *  It does not simulate machine power loss, which can also lose OS buffers.)
  */
 #include "quarry.h"
 
@@ -21,7 +23,8 @@ static void usage(FILE *f) {
           "  .schema NAME    show a table's CREATE statement\n"
           "  .open FILE      switch database file\n"
           "  .checkpoint     flush the WAL into the data file\n"
-          "  .crash          kill without checkpoint (recovery test hook)\n"
+          "  .crash          simulate an OS/process crash (no checkpoint;\n"
+          "                  fsynced commits survive - not full power loss)\n"
           "  .exit           checkpoint and quit\n", f);
 }
 
@@ -99,7 +102,8 @@ int main(int argc, char **argv) {
                     else q_out("checkpoint complete.\n");
                 }
                 else if (!strcmp(cmd, ".open")) {
-                    if (!arg) fprintf(stderr, "error: .open needs a path\n");
+                    if (db_in_txn(d)) fprintf(stderr, "error: COMMIT or ROLLBACK before .open (refusing to silently roll back)\n");
+                    else if (!arg) fprintf(stderr, "error: .open needs a path\n");
                     else {
                         arg[strcspn(arg, "\r\n")] = 0;
                         db_close(d);

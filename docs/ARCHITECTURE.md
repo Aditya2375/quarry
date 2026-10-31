@@ -29,7 +29,11 @@ fixed-size table descriptions (name, root page, column list).
    set; reads check the dirty set, then the WAL map, then the data file.
 2. `pager_commit` appends every dirty page to the WAL as a frame
    (magic, page number, committed page count on the last frame, CRC32 of
-   the payload), then fsyncs. Only then does the commit report success.
+   the payload), then fsyncs. Only then are the in-memory WAL map and the
+   page count updated and the commit reported successful. If any write or
+   the fsync fails, the partial frame tail is truncated back: the WAL
+   looks exactly as it did before the commit, and the still-open
+   transaction can be rolled back or retried.
 3. `pager_rollback` drops the dirty set. Nothing uncommitted ever reaches
    the file, so rollback is that simple.
 4. A checkpoint (on close, on `.checkpoint`, or automatically after 2000
@@ -37,12 +41,26 @@ fixed-size table descriptions (name, root page, column list).
    and truncates the WAL.
 5. On open, recovery scans the WAL: frames are validated (magic + CRC),
    complete transactions are folded into the in-memory WAL map, and a
-   torn or corrupt tail (the crash point) is ignored.
+   torn or corrupt tail (the crash point) is ignored. One deliberate
+   trade-off: a CRC failure stops recovery at that frame, so if a
+   *completed* frame is ever damaged, later committed transactions are
+   dropped too - CRCs prove where valid data ends, not where corruption
+   ends. The data file is untouched, so the database always opens at a
+   consistent (at worst slightly older) state.
 
 Consequences: a crash at any point leaves either the old state or the new
 state, never a blend; and an in-progress transaction is invisible after a
 crash. `.crash` in the REPL exercises exactly this path (it exits without
-checkpointing).
+checkpointing): it simulates an OS or process crash, after which every
+fsynced commit must survive. It does not simulate machine power loss,
+which can also drop OS page-cache buffers; directory entries created for
+the data and WAL files are fsynced at open to keep that part durable.
+
+A failed *statement* inside an explicit transaction follows the same
+idea at a smaller scale: the executor marks a savepoint before the
+statement and restores the dirty-set length and page count on failure,
+which discards exactly that statement's pages while the transaction
+stays open.
 
 ## Trade-offs (why it is small enough to verify)
 

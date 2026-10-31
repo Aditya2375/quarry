@@ -133,7 +133,7 @@ int db_open(struct db **out, const char *path) {
     if (!d) return fail(Q_ERR_NOMEM, "out of memory");
     int rc = pager_open(&d->pg, path);
     if (rc != Q_OK) { free(d); return rc; }
-    if ((rc = load_catalog(d)) != Q_OK) { free(d); return rc; }
+    if ((rc = load_catalog(d)) != Q_OK) { pager_close(d->pg); free(d); return rc; }
     *out = d;
     return Q_OK;
 }
@@ -147,6 +147,7 @@ void db_abandon(struct db *d) {
     free(d);
 }
 int db_checkpoint(struct db *d) { return pager_checkpoint(d->pg); }
+bool db_in_txn(struct db *d) { return d->explicit_txn; }
 
 /* ---------- value checks ---------- */
 static int check_value(struct coldef *cd, struct qval *v) {
@@ -175,13 +176,18 @@ static int val_cmp(const struct qval *a, const struct qval *b) {
     if (b->type != Q_COL_TEXT) return -2;
     uint32_t n = a->slen < b->slen ? a->slen : b->slen;
     int r = n ? memcmp(a->s, b->s, n) : 0;
-    if (r) return r;
+    /* normalize: memcmp can return any magnitude (e.g. -2), which would
+       collide with the -2 type-mismatch sentinel above */
+    if (r) return r < 0 ? -1 : 1;
     return a->slen < b->slen ? -1 : a->slen > b->slen ? 1 : 0;
 }
 
 static int cond_match(struct tabledef *t, struct cond *cd, struct qval *vals, bool *match) {
     int ci = col_index(t, cd->col);
     if (ci < 0) return fail(Q_ERR_SCHEMA, "no column named %s", cd->col);
+    /* three-valued logic: a comparison that touches NULL is unknown,
+       and unknown is not true - the row does not match (SQL semantics) */
+    if (vals[ci].type == 0 || cd->v.type == 0) { *match = false; return Q_OK; }
     int cmp = val_cmp(&vals[ci], &cd->v);
     if (cmp == -2) return fail(Q_ERR_TYPE, "type mismatch in WHERE on column %s", cd->col);
     bool m;
@@ -236,14 +242,16 @@ static int exec_insert(struct db *d, struct stmt *st) {
     struct tabledef *t = find_table(d, st->table);
     if (!t) return fail(Q_ERR_SCHEMA, "no table named %s", st->table);
     struct qval vals[Q_MAX_COLS] = {{0}};
+    bool seen[Q_MAX_COLS] = {false};
     if (st->ninsert_cols) {
         if (st->ninsert_cols != st->nvals)
             return fail(Q_ERR_SCHEMA, "column list and VALUES have different lengths");
         for (int i = 0; i < st->nvals; i++) {
             int ci = col_index(t, st->insert_cols[i]);
             if (ci < 0) return fail(Q_ERR_SCHEMA, "no column named %s", st->insert_cols[i]);
-            if (vals[ci].type != 0)
+            if (seen[ci])
                 return fail(Q_ERR_SCHEMA, "column %s listed twice", st->insert_cols[i]);
+            seen[ci] = true;
             vals[ci] = st->vals[i];
         }
     } else {
@@ -272,10 +280,13 @@ static int exec_insert(struct db *d, struct stmt *st) {
     uint32_t len = row_encode(t, vals, buf);
     uint32_t old_root = t->root;
     int rc = btree_insert(d->pg, &t->root, key, buf, len);
-    if (rc == Q_ERR_CONSTRAINT)
-        return fail(rc, "duplicate primary key %lld", (long long)key);
-    if (rc != Q_OK) return rc;
-    if (t->root != old_root && (rc = save_table(d, t)) != Q_OK) return rc;
+    if (rc != Q_OK) {
+        t->root = old_root;   /* statement failed: in-memory root must match the pages again */
+        if (rc == Q_ERR_CONSTRAINT)
+            return fail(rc, "duplicate primary key %lld", (long long)key);
+        return rc;
+    }
+    if (t->root != old_root && (rc = save_table(d, t)) != Q_OK) { t->root = old_root; return rc; }
     q_out("1 row inserted.\n");
     return Q_OK;
 }
@@ -286,11 +297,16 @@ static int rowvec_push(struct rowvec *rv, int64_t key, const uint8_t *row, uint3
         return fail(Q_ERR_TOO_BIG, "too many matching rows (limit 100000)");
     if (rv->n == rv->cap) {
         size_t nc = rv->cap ? rv->cap * 2 : 64;
+        /* install each realloc only when it succeeds: a failed one leaves
+           the original block owned by rv, so nothing is freed twice */
         int64_t *nk = realloc(rv->keys, nc * sizeof *nk);
         uint8_t **nr = realloc(rv->rows, nc * sizeof *nr);
         uint32_t *nl = realloc(rv->lens, nc * sizeof *nl);
-        if (!nk || !nr || !nl) { free(nk); free(nr); free(nl); return fail(Q_ERR_NOMEM, "out of memory"); }
-        rv->keys = nk; rv->rows = nr; rv->lens = nl; rv->cap = nc;
+        if (nk) rv->keys = nk;
+        if (nr) rv->rows = nr;
+        if (nl) rv->lens = nl;
+        if (!nk || !nr || !nl) return fail(Q_ERR_NOMEM, "out of memory");
+        rv->cap = nc;
     }
     uint8_t *copy = malloc(len ? len : 1);
     if (!copy) return fail(Q_ERR_NOMEM, "out of memory");
@@ -367,6 +383,8 @@ static int exec_select(struct db *d, struct stmt *st) {
     if (!t) return fail(Q_ERR_SCHEMA, "no table named %s", st->table);
 
     if (st->sel_count) {
+        if (st->has_order || st->has_limit)
+            return fail(Q_ERR_SYNTAX, "ORDER BY and LIMIT are not supported with COUNT(*)");
         int64_t n;
         int rc = collect(d, t, st, NULL, &n);
         if (rc != Q_OK) return rc;
@@ -449,6 +467,7 @@ static int exec_update(struct db *d, struct stmt *st) {
     int rc = collect(d, t, st, &rv, NULL);
     if (rc != Q_OK) { rowvec_free(&rv); return rc; }
     uint8_t buf[Q_MAX_ROW_BYTES + 64];
+    uint32_t root0 = t->root;
     for (size_t r = 0; r < rv.n; r++) {
         struct qval vals[Q_MAX_COLS];
         if ((rc = row_decode(t, rv.rows[r], rv.lens[r], vals)) != Q_OK) break;
@@ -464,7 +483,7 @@ static int exec_update(struct db *d, struct stmt *st) {
         if ((rc = btree_insert(d->pg, &t->root, newkey, buf, len)) != Q_OK) break;
         if (t->root != old_root && (rc = save_table(d, t)) != Q_OK) break;
     }
-    if (rc != Q_OK) { rowvec_free(&rv); return rc; }
+    if (rc != Q_OK) { t->root = root0; rowvec_free(&rv); return rc; }
     q_out("%zu row%s updated.\n", rv.n, rv.n == 1 ? "" : "s");
     rowvec_free(&rv);
     return Q_OK;
@@ -521,9 +540,18 @@ int db_exec(struct db *d, const char *sql) {
     }
 
     bool own_txn = false;
-    if (needs_txn(st.kind) && !d->explicit_txn) {
-        if ((rc = pager_begin(d->pg)) != Q_OK) { stmt_free(&st); return rc; }
-        own_txn = true;
+    struct pager_savepoint sp;
+    bool have_sp = false;
+    if (needs_txn(st.kind)) {
+        if (!d->explicit_txn) {
+            if ((rc = pager_begin(d->pg)) != Q_OK) { stmt_free(&st); return rc; }
+            own_txn = true;
+        } else {
+            /* statement atomicity inside an explicit transaction: a failed
+               statement undoes only its own pages, the txn stays usable */
+            pager_sp_mark(d->pg, &sp);
+            have_sp = true;
+        }
     }
     switch (st.kind) {
         case S_CREATE: rc = exec_create(d, &st); break;
@@ -537,6 +565,9 @@ int db_exec(struct db *d, const char *sql) {
     if (own_txn) {
         if (rc != Q_OK) pager_rollback(d->pg);
         else rc = pager_commit(d->pg);
+    } else if (have_sp && rc != Q_OK) {
+        pager_sp_restore(d->pg, &sp);
+        load_catalog(d);   /* resync in-memory roots with the restored pages */
     }
     return rc;
 }
