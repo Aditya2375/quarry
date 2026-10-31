@@ -4,8 +4,8 @@
  *   INSERT INTO name [(cols)] VALUES (lit, ...)   (one row per statement)
  *   SELECT * | cols | COUNT(*) FROM name [WHERE cond [AND ...]]
  *        [ORDER BY col [ASC|DESC]] [LIMIT n]
- *   UPDATE name SET col = lit [, ...] WHERE cond [AND ...]
- *   DELETE FROM name WHERE cond [AND ...]
+ *   UPDATE name SET col = lit [, ...] [WHERE cond [AND ...]]
+ *   DELETE FROM name [WHERE cond [AND ...]]
  *   BEGIN | COMMIT | ROLLBACK
  *
  *   cond: col op lit    op: = != < <= > >=
@@ -93,10 +93,17 @@ static void next(struct parser *ps) {
         for (;;) {
             if (!*c) { free(s); ps->t.kind = T_END; ps->cur = c; return; }
             if (*c == '\'') {
-                if (c[1] == '\'') { c += 2; }
-                else { c++; break; }
+                if (c[1] == '\'') {
+                    /* SQL escape: '' inside a literal is one quote */
+                    if (n + 2 > cap) { cap *= 2; char *ns = realloc(s, cap); if (!ns) { free(s); ps->t.kind = T_END; ps->cur = c; return; } s = ns; }
+                    s[n++] = '\'';
+                    c += 2;
+                    continue;
+                }
+                c++;
+                break;
             }
-            if (n + 2 > cap) { cap *= 2; s = realloc(s, cap); if (!s) { ps->t.kind = T_END; ps->cur = c; return; } }
+            if (n + 2 > cap) { cap *= 2; char *ns = realloc(s, cap); if (!ns) { free(s); ps->t.kind = T_END; ps->cur = c; return; } s = ns; }
             s[n++] = *c++;
         }
         s[n] = 0;

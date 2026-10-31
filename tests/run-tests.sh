@@ -23,6 +23,7 @@ run_case() {
 
 run_case crud
 run_case errors
+run_case strings
 run_case txn
 run_case stmtatomic
 run_case nulls
@@ -519,6 +520,59 @@ elif cc -shared -fPIC -O2 tests/shim.c -o "$T/shim.so" -ldl 2>/dev/null; then
   else
     echo "FAIL: db_close failure silent (rc=$rc, see $T/r4n6.err)"; fails=$((fails + 1))
   fi
+
+  # R5 F-B: a failed auto-commit (WAL write error) must not wedge the
+  # session: the uncommitted row disappears, the pager leaves its txn, and
+  # later statements work once the fault clears
+  rm -f "$T/r5fb.qry" "$T/r5fb.qry.wal" "$T/r5fb.mark" "$T/r5fb.fifo"
+  mkfifo "$T/r5fb.fifo"
+  QSHIM=1 QSHIM_MARKER="$T/r5fb.mark" QSHIM_FAIL_WRITE=1 \
+    LD_PRELOAD="$T/shim.so" "$BIN" "$T/r5fb.qry" < "$T/r5fb.fifo" > "$T/r5fb.out" 2> "$T/r5fb.err" &
+  shim_pid=$!
+  { printf "CREATE TABLE t (id INT PRIMARY KEY);\n"; sleep 1
+    touch "$T/r5fb.mark"
+    printf "INSERT INTO t VALUES (1);\n"; sleep 1
+    rm "$T/r5fb.mark"
+    printf "SELECT COUNT(*) FROM t;\nINSERT INTO t VALUES (2);\nSELECT COUNT(*) FROM t;\n"; sleep 1; } > "$T/r5fb.fifo"
+  wait $shim_pid && rc=0 || rc=$?
+  if grep -q "error: WAL write failed" "$T/r5fb.err" \
+     && [ "$(grep -c 'error:' "$T/r5fb.err")" -eq 1 ] \
+     && grep -q "1 row inserted." "$T/r5fb.out" \
+     && [ "$(grep -A1 '^count' "$T/r5fb.out" | grep -c '^0$')" -eq 1 ] \
+     && [ "$(grep -A1 '^count' "$T/r5fb.out" | grep -c '^1$')" -eq 1 ]; then
+    echo "ok: failed auto-commit rolls back, session stays usable"
+  else
+    echo "FAIL: R5 F-B (see $T/r5fb.out and $T/r5fb.err)"; fails=$((fails + 1))
+  fi
+
+  # R5 F-C: checkpoint checks data fsync and the WAL header rewrite + fsync.
+  # Each fault must produce an honest error (no "checkpoint complete."),
+  # leave the database readable, and let a later checkpoint succeed.
+  for mode in MAIN_FSYNC WRITE FSYNC; do
+    rm -f "$T/r5fc.qry" "$T/r5fc.qry.wal" "$T/r5fc.mark" "$T/r5fc.fifo"
+    mkfifo "$T/r5fc.fifo"
+    env QSHIM=1 QSHIM_MARKER="$T/r5fc.mark" "QSHIM_FAIL_$mode=1" \
+      LD_PRELOAD="$T/shim.so" "$BIN" "$T/r5fc.qry" < "$T/r5fc.fifo" > "$T/r5fc.out" 2> "$T/r5fc.err" &
+    shim_pid=$!
+    { printf "CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\n"; sleep 1
+      touch "$T/r5fc.mark"
+      printf ".checkpoint\n"; sleep 1
+      rm "$T/r5fc.mark"
+      printf "SELECT COUNT(*) FROM t;\n.checkpoint\n"; sleep 1; } > "$T/r5fc.fifo"
+    wait $shim_pid && rc=0 || rc=$?
+    if grep -q "error: " "$T/r5fc.err" \
+       && [ "$(grep -c 'checkpoint complete.' "$T/r5fc.out")" -eq 1 ] \
+       && grep -A1 '^count' "$T/r5fc.out" | grep -q '^1$'; then
+      echo "ok: checkpoint failure ($mode) is reported, no silent success"
+    else
+      echo "FAIL: R5 F-C $mode (see $T/r5fc.out and $T/r5fc.err)"; fails=$((fails + 1))
+    fi
+    out=$(printf "SELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r5fc.qry" 2>&1)
+    case "$out" in
+      *"1"*) echo "ok: data survives a failed checkpoint ($mode)";;
+      *) echo "FAIL: data lost after failed checkpoint $mode: [$out]"; fails=$((fails + 1));;
+    esac
+  done
 else
   echo "skip: fault-injection shim not buildable here"
 fi

@@ -89,23 +89,34 @@ static void cat_decode(const uint8_t *rec, struct tabledef *t) {
 }
 
 static int load_catalog(struct db *d) {
-    d->ntabs = 0;
+    /* build into scratch and swap only on success: a failed resync keeps
+       the old catalog, so later statements still reach the pager and get
+       its real error instead of a misleading "no table named ..." from a
+       half-loaded catalog */
+    struct tabledef *tabs = calloc(MAX_TABLES, sizeof *tabs);
+    if (!tabs) return fail(Q_ERR_NOMEM, "out of memory");
+    int ntabs = 0;
     uint32_t root; uint64_t seq;
     int rc = pager_get_catalog(d->pg, &root, &seq);
-    if (rc != Q_OK) return rc;
-    if (root == 0) return Q_OK;
-    struct cursor c;
-    if ((rc = cursor_first(d->pg, root, &c)) != Q_OK) return rc;
-    while (!c.done) {
-        if (d->ntabs == MAX_TABLES) return fail(Q_ERR_TOO_BIG, "too many tables (max 64)");
-        int64_t key; uint8_t rec[CAT_REC_LEN]; uint32_t len = sizeof rec;
-        if ((rc = cursor_get(&c, &key, rec, &len)) != Q_OK) return rc;
-        cat_decode(rec, &d->tabs[d->ntabs]);
-        d->tabs[d->ntabs].catkey = (uint64_t)key;
-        d->ntabs++;
-        if ((rc = cursor_next(&c)) != Q_OK) return rc;
+    if (rc == Q_OK && root != 0) {
+        struct cursor c;
+        rc = cursor_first(d->pg, root, &c);
+        while (rc == Q_OK && !c.done) {
+            if (ntabs == MAX_TABLES) { rc = fail(Q_ERR_TOO_BIG, "too many tables (max 64)"); break; }
+            int64_t key; uint8_t rec[CAT_REC_LEN]; uint32_t len = sizeof rec;
+            if ((rc = cursor_get(&c, &key, rec, &len)) != Q_OK) break;
+            cat_decode(rec, &tabs[ntabs]);
+            tabs[ntabs].catkey = (uint64_t)key;
+            ntabs++;
+            rc = cursor_next(&c);
+        }
     }
-    return Q_OK;
+    if (rc == Q_OK) {
+        memcpy(d->tabs, tabs, (size_t)ntabs * sizeof *tabs);
+        d->ntabs = ntabs;
+    }
+    free(tabs);
+    return rc;
 }
 
 /* rewrite a table's catalog record (root page changes on root splits) */
@@ -577,8 +588,25 @@ int db_exec(struct db *d, const char *sql) {
             /* pages reverted; resync in-memory roots with the catalog */
             int crc2 = load_catalog(d);
             if (crc2 != Q_OK) rc = crc2;
+        } else {
+            rc = pager_commit(d->pg);
+            if (rc != Q_OK) {
+                /* a failed commit leaves the pager mid-transaction; roll it
+                   back or the session wedges: later statements would see the
+                   uncommitted pages and every INSERT would report "already
+                   inside a transaction". pager_rollback is a harmless no-op
+                   error on the commit paths that already cleared the txn
+                   state, so its result is ignored here. The catalog resync
+                   is best-effort too: when it fails (e.g. the pager broke),
+                   the original commit error says more, so rc and q_err are
+                   both kept. */
+                char saved_err[sizeof q_err];
+                memcpy(saved_err, q_err, sizeof saved_err);
+                pager_rollback(d->pg);
+                load_catalog(d);
+                memcpy(q_err, saved_err, sizeof q_err);
+            }
         }
-        else rc = pager_commit(d->pg);
     } else if (have_sp && rc != Q_OK) {
         pager_sp_restore(d->pg, &sp);
         /* resync in-memory roots with the restored pages; if that fails the

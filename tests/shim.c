@@ -48,9 +48,20 @@ int ftruncate(int fd, off_t len) {
     return real(fd, len);
 }
 
+static int is_db(int fd) {
+    char link[64], path[4096];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, path, sizeof path - 1);
+    if (n <= 0) return 0;
+    path[n] = 0;
+    size_t l = strlen(path);
+    return l >= 4 && !strcmp(path + l - 4, ".qry");
+}
+
 int fsync(int fd) {
     static int (*real)(int);
     if (!real) real = dlsym(RTLD_NEXT, "fsync");
     if (armed() && getenv("QSHIM_FAIL_FSYNC") && is_wal(fd)) { errno = EIO; return -1; }
+    if (armed() && getenv("QSHIM_FAIL_MAIN_FSYNC") && is_db(fd)) { errno = EIO; return -1; }
     return real(fd);
 }

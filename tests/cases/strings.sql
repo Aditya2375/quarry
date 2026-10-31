@@ -1,0 +1,13 @@
+CREATE TABLE s (id INT PRIMARY KEY, v TEXT);
+INSERT INTO s VALUES (1, 'a''b');
+INSERT INTO s VALUES (2, 'x''');
+INSERT INTO s VALUES (3, '''');
+INSERT INTO s VALUES (4, '''''');
+INSERT INTO s VALUES (5, 'it''s a ''quoted'' word');
+INSERT INTO s VALUES (6, 'plain');
+SELECT v FROM s ORDER BY id;
+SELECT v FROM s WHERE v = 'a''b';
+UPDATE s SET v = 'was ''plain''' WHERE id = 6;
+SELECT v FROM s WHERE id = 6;
+DELETE FROM s WHERE v = '''';
+SELECT COUNT(*) FROM s;

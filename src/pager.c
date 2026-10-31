@@ -571,15 +571,26 @@ int pager_checkpoint(struct pager *p) {
     put32(hdr + H_PAGES, p->page_count);
     if (write_full(p->fd, hdr, Q_PAGE_SIZE, 0) < 0)
         return set_err(Q_ERR_IO, "header write failed");
-    fsync(p->fd);
+    /* data must be durable in the main file before the WAL is truncated;
+       on failure the WAL is untouched and recovery replays it */
+    if (fsync(p->fd) != 0)
+        return set_err(Q_ERR_IO, "checkpoint fsync failed - WAL left intact");
     if (ftruncate(p->wal_fd, 0) != 0) return set_err(Q_ERR_IO, "WAL truncate failed");
-    uint8_t wh[16] = {0};
-    put32(wh, WAL_MAGIC);
-    write_full(p->wal_fd, wh, sizeof wh, 0);
-    fsync(p->wal_fd);
+    /* Past the truncate the pages are durable in the main file, so the
+       checkpoint has logically happened even if the WAL housekeeping below
+       fails. Drop the in-memory map now: leaving stale frame offsets would
+       send later reads chasing a WAL that no longer exists. A missing or
+       torn WAL header is fine - the next open reinitializes an empty WAL
+       or refuses a torn one, and no data depends on it either way. */
     free(p->wm.keys); free(p->wm.offs);
     memset(&p->wm, 0, sizeof p->wm);
     p->frames_since_ckpt = 0;
+    uint8_t wh[16] = {0};
+    put32(wh, WAL_MAGIC);
+    if (write_full(p->wal_fd, wh, sizeof wh, 0) < 0)
+        return set_err(Q_ERR_IO, "WAL header rewrite failed after checkpoint");
+    if (fsync(p->wal_fd) != 0)
+        return set_err(Q_ERR_IO, "WAL fsync failed after checkpoint");
     return Q_OK;
 }
 

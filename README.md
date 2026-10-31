@@ -76,6 +76,11 @@ make check                    # full test suite
 - Deletes compact the leaf page but never merge or rebalance the tree, so
   a table that shrinks keeps its sparse pages until it is rebuilt.
 - One row is capped at 1000 bytes; text values at 800 bytes.
+- Fixed caps: 64 tables, 16 columns per table, 8 ANDed `WHERE`
+  conditions, 31-character names. `COUNT(*)` takes no `ORDER BY` or
+  `LIMIT`.
+- Strict typing: comparing or assigning a value of the wrong type
+  (`WHERE name = 5` on a TEXT column) is a type error, not a coercion.
 - Single-writer, no concurrency control, no networking.
 - The database file only grows (no free list); checkpoints reclaim WAL
   space, not data pages.

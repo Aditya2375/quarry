@@ -1,0 +1,26 @@
+table S created.
+1 row inserted.
+1 row inserted.
+1 row inserted.
+1 row inserted.
+1 row inserted.
+1 row inserted.
+V
+a'b
+x'
+'
+''
+it's a 'quoted' word
+plain
+(6 rows)
+V
+a'b
+(1 row)
+1 row updated.
+V
+was 'plain'
+(1 row)
+1 row deleted.
+count
+5
+(1 row)
