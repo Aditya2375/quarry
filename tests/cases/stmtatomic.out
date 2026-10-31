@@ -31,3 +31,32 @@ ID | V
 1  | one
 2  | two
 (2 rows)
+table W created.
+1 row inserted.
+1 row inserted.
+1 row inserted.
+begin.
+1 row inserted.
+ERROR: duplicate key 2
+ID | V
+1  | 10
+2  | 20
+3  | 30
+4  | 40
+(4 rows)
+commit.
+ID | V
+1  | 10
+2  | 20
+3  | 30
+4  | 40
+(4 rows)
+begin.
+1 row inserted.
+ERROR: duplicate key 2
+ID | V
+1  | one
+2  | two
+5  | five
+(3 rows)
+commit.

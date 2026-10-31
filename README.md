@@ -40,14 +40,19 @@ make check                    # full test suite
   `PRIMARY KEY`), `INSERT` (positional or named columns), `SELECT` with
   `WHERE` (ANDed `= != < <= > >=`), `ORDER BY`, `LIMIT`, `COUNT(*)`,
   `UPDATE`, `DELETE`. NULLs supported with SQL three-valued logic:
-  a `WHERE` comparison that touches NULL never matches the row.
+  a `WHERE` comparison that touches NULL never matches the row. There is
+  no `IS NULL` syntax; `= NULL` parses but, per three-valued logic, never
+  matches.
 - **Every statement is atomic.** A failed statement inside an explicit
   transaction undoes only its own pages; the transaction stays open.
   A failed `COMMIT` (disk full, I/O error) leaves no trace: partial WAL
   frames are truncated away and the transaction can still be rolled back.
 - **Corruption is contained.** Every B+tree page is validated when read
-  (type, cell counts, cell bounds), so a corrupted file produces a clean
-  error, not a crash or an infinite loop.
+  (type, cell counts, cell bounds, used-bytes consistency, key ordering),
+  row field tags are checked against column types, scans carry a
+  scan-long cycle budget, and recovery truncates the WAL at the last valid
+  commit boundary, so a corrupted file produces a clean error, not a crash
+  or an infinite loop.
 - **Tested like it matters.** 38,395 pager/B+tree unit checks (insert /
   find / scan / delete against a model, with commit-close-reopen and
   crash-recovery cycles, plus corrupt-page rejection), scripted CRUD /

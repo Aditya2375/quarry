@@ -356,7 +356,7 @@ int sql_parse(const char *text, struct stmt *st) {
     else if (kw(&ps, "BEGIN")) { st->kind = S_BEGIN; next(&ps); rc = Q_OK; }
     else if (kw(&ps, "COMMIT")) { st->kind = S_COMMIT; next(&ps); rc = Q_OK; }
     else if (kw(&ps, "ROLLBACK")) { st->kind = S_ROLLBACK; next(&ps); rc = Q_OK; }
-    else return fail(&ps, "expected CREATE, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT or ROLLBACK");
+    else rc = fail(&ps, "expected CREATE, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT or ROLLBACK");
     if (rc == Q_OK) {
         if (st->kind == S_BEGIN || st->kind == S_COMMIT || st->kind == S_ROLLBACK) {
             if (ps.t.kind == T_PUNCT && ps.t.ch == ';') next(&ps);

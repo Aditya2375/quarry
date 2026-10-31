@@ -90,6 +90,10 @@ struct cursor {
     uint32_t leaf;
     int idx;
     int done;
+    /* sibling-link hop budget for the WHOLE scan, not one cursor_next call:
+       a cycle through non-empty leaves must trip it too */
+    uint32_t steps;
+    uint32_t limit;
 };
 int cursor_first(struct pager *p, uint32_t root, struct cursor *c);
 int cursor_next(struct cursor *c);

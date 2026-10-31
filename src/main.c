@@ -106,7 +106,7 @@ int main(int argc, char **argv) {
                     else if (!arg) fprintf(stderr, "error: .open needs a path\n");
                     else {
                         arg[strcspn(arg, "\r\n")] = 0;
-                        db_close(d);
+                        if (db_close(d) != Q_OK) { fprintf(stderr, "error: %s\n", q_err); return 1; }
                         if (db_open(&d, arg) != Q_OK) { fprintf(stderr, "error: %s\n", q_err); return 1; }
                     }
                 }

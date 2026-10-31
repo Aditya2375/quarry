@@ -197,6 +197,107 @@ print("ok: corrupted pages rejected (ncells overflow, self-loop, bad type)")
 PY
 [ $? -eq 0 ] || fails=$((fails + 1))
 
+
+# round-2 H3a regression: a sibling-link cycle through NON-EMPTY leaves must
+# error, not spin (the step counter used to reset on every cursor_next call,
+# so COUNT(*) hung at 100% CPU on a cycle through leaves with cells)
+python3 - "$T" <<'PY'
+import subprocess, sys, os
+td, = sys.argv[1:2]
+binp = "build/quarry"
+db = os.path.join(td, "linkcycle.qry")
+sql = "CREATE TABLE t (id INT PRIMARY KEY, v TEXT);\n" + "".join(
+    "INSERT INTO t VALUES (%d, 'row%d');\n" % (i, i) for i in range(1, 201))
+r = subprocess.run([binp, db], input=sql, text=True, capture_output=True)
+assert r.returncode == 0, r.stderr
+with open(db, "rb") as f:
+    data = f.read()
+pg = None
+for p in range(len(data) // 4096 - 1, 0, -1):
+    if data[p * 4096] == 1 and int.from_bytes(data[p*4096+1:p*4096+3], "little") > 0:
+        pg = p
+        break
+assert pg, "no non-empty leaf found"
+with open(db, "r+b") as f:
+    f.seek(pg * 4096 + 7)              # PH_LINK
+    f.write(pg.to_bytes(4, "little"))  # self-link
+try:
+    r = subprocess.run([binp, db, "-c", "SELECT COUNT(*) FROM t;"],
+                       text=True, capture_output=True, timeout=15)
+except subprocess.TimeoutExpired:
+    raise AssertionError("COUNT(*) hung on a sibling-link cycle")
+assert r.returncode == 1 and "corrupt" in r.stderr, (r.returncode, r.stderr)
+print("ok: non-empty leaf sibling cycle errors instead of hanging")
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
+
+# round-2 H3b regressions: PH_USED must match the packed cells, leaf key
+# order is enforced, and row field tags must match column types
+python3 - "$T" <<'PY'
+import subprocess, sys, os
+td, = sys.argv[1:2]
+binp = "build/quarry"
+
+def makedb(name, rows):
+    db = os.path.join(td, name)
+    sql = "CREATE TABLE t (id INT PRIMARY KEY, v TEXT);\n" + "".join(
+        "INSERT INTO t VALUES (%d, 'row%d');\n" % (i, i) for i in range(1, rows + 1))
+    r = subprocess.run([binp, db], input=sql, text=True, capture_output=True)
+    assert r.returncode == 0, r.stderr
+    return db
+
+def last_leaf(db, ncells_min=1):
+    with open(db, "rb") as f:
+        data = f.read()
+    for p in range(len(data) // 4096 - 1, 0, -1):
+        if data[p * 4096] == 1 and int.from_bytes(data[p*4096+1:p*4096+3], "little") >= ncells_min:
+            return p
+    raise AssertionError("no leaf found")
+
+# used=0 on a leaf with cells: a 780-byte insert used to memmove past the page
+db = makedb("usedzero.qry", 50)
+pg = last_leaf(db)
+with open(db, "r+b") as f:
+    f.seek(pg * 4096 + 3); f.write(b"\x00\x00\x00\x00")
+r = subprocess.run([binp, db, "-c", "INSERT INTO t VALUES (999999, '%s');" % ("x" * 780)],
+                   text=True, capture_output=True, timeout=15)
+assert r.returncode == 1 and "corrupt" in r.stderr, (r.returncode, r.stderr)
+
+# out-of-order keys inside a leaf
+db = makedb("keyorder.qry", 50)
+pg = last_leaf(db, 2)
+with open(db, "r+b") as f:
+    f.seek(pg * 4096 + 16)                       # first cell's key
+    f.write(b"\xff\xff\xff\xff\xff\xff\xff\x7f")  # huge key ahead of smaller ones
+r = subprocess.run([binp, db, "-c", "SELECT COUNT(*) FROM t;"],
+                   text=True, capture_output=True, timeout=15)
+assert r.returncode == 1 and "corrupt" in r.stderr, (r.returncode, r.stderr)
+
+# row field tag contradicts the column type (TEXT column, INT tag)
+db = makedb("badtag.qry", 200)
+pg = last_leaf(db)
+with open(db, "r+b") as f:
+    f.seek(pg * 4096 + 16 + 10 + 9)  # first cell: past key+len, past INT field
+    f.write(b"\x01")
+r = subprocess.run([binp, db, "-c", "SELECT * FROM t;"],
+                   text=True, capture_output=True, timeout=15)
+assert r.returncode == 1 and "corrupt" in r.stderr, (r.returncode, r.stderr)
+print("ok: PH_USED / key-order / row-type corruption rejected")
+PY
+[ $? -eq 0 ] || fails=$((fails + 1))
+
+# round-2 N1 regression: garbage appended to the WAL tail is truncated at
+# open, so commits that follow it stay reachable after later crashes
+rm -f "$T/waltail.qry" "$T/waltail.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY, v INT);\nINSERT INTO t VALUES (1, 1);\n.crash\n" | "$BIN" "$T/waltail.qry" > /dev/null 2>&1 || true
+python3 -c "open('$T/waltail.qry.wal','ab').write(b'X'*100)"
+printf "INSERT INTO t VALUES (2, 2);\n.crash\n" | "$BIN" "$T/waltail.qry" > /dev/null 2>&1 || true
+out=$("$BIN" "$T/waltail.qry" -c "SELECT id FROM t ORDER BY id;")
+if [ "$out" = "ID
+1
+2
+(2 rows)" ]; then echo "ok: garbage WAL tail truncated at open"; else echo "FAIL: WAL tail: [$out]"; fails=$((fails + 1)); fi
+
 # fuzzing: garbage SQL + on-disk corruption (shipped harness, see README)
 python3 tests/fuzz.py || fails=$((fails + 1))
 

@@ -66,6 +66,15 @@ struct pager {
     struct walmap wm;
     size_t frames_since_ckpt;
 
+    /* statement savepoint undo log: before-images of pages that were
+       already dirty when the savepoint was marked. Truncating the dirty
+       set alone cannot undo edits made in place to such pages. */
+    bool     sp_active;
+    size_t   sp_ndirty;
+    uint32_t *undo_pgno;
+    uint8_t (*undo_img)[Q_PAGE_SIZE];
+    size_t   nundo, undo_cap;
+
     /* rotating read buffers: a B+tree descent may hold several levels
        at once, so one static buffer is not enough */
     uint8_t rbuf[32][Q_PAGE_SIZE];
@@ -184,12 +193,22 @@ static int walmap_put(struct pager *p, uint32_t pgno, uint64_t off) {
 /* ---------- open / recover ---------- */
 static int wal_recover(struct pager *p) {
     uint8_t hdr[16];
-    if (read_full(p->wal_fd, hdr, sizeof hdr, 0) != (ssize_t)sizeof hdr)
-        return Q_OK; /* no or empty WAL: nothing to replay */
-    if (get32(hdr) != WAL_MAGIC)
-        return Q_OK; /* foreign or half-written header: ignore WAL entirely */
+    if (read_full(p->wal_fd, hdr, sizeof hdr, 0) != (ssize_t)sizeof hdr ||
+        get32(hdr) != WAL_MAGIC) {
+        /* empty, foreign or half-written WAL: nothing replayable. Reset it
+           rather than ignoring it - appending after garbage would strand
+           future commits behind bytes recovery can never cross */
+        if (ftruncate(p->wal_fd, 0) != 0)
+            return set_err(Q_ERR_IO, "WAL reset failed");
+        uint8_t wh[16] = {0};
+        put32(wh, WAL_MAGIC);
+        if (write_full(p->wal_fd, wh, sizeof wh, 0) < 0)
+            return set_err(Q_ERR_IO, "WAL header write failed");
+        return Q_OK;
+    }
 
     uint64_t off = 16;
+    uint64_t last_commit_end = 16;
     uint32_t pending_since_commit = 0;
     uint64_t tx_start = 16;
     for (;;) {
@@ -216,10 +235,17 @@ static int wal_recover(struct pager *p) {
             }
             p->page_count = commit_pages;
             pending_since_commit = 0;
+            last_commit_end = off + 16 + Q_PAGE_SIZE;
         }
         off += 16 + Q_PAGE_SIZE;
     }
-    /* frames of a dead final transaction are ignored */
+    /* Anything past the last valid commit boundary - a torn tail, garbage
+       appended while the file was offline, or frames of a dead transaction
+       - must not survive open: future commits would append behind it and
+       recovery would never reach them. This also removes a partial tail a
+       failed commit could not truncate away itself. */
+    if (ftruncate(p->wal_fd, (off_t)last_commit_end) != 0)
+        return set_err(Q_ERR_IO, "WAL tail truncate failed");
     return Q_OK;
 }
 
@@ -260,14 +286,21 @@ int pager_open(struct pager **out, const char *path) {
         put32(hdr + H_PAGES, 1);
         put32(hdr + H_CATROOT, 0);
         put64le(hdr + H_CATSEQ, 1);
-        if (write_full(p->fd, hdr, Q_PAGE_SIZE, 0) < 0)
-            return set_err(Q_ERR_IO, "cannot initialize database file");
-        fsync(p->fd);
+        if (write_full(p->fd, hdr, Q_PAGE_SIZE, 0) < 0) {
+            rc = set_err(Q_ERR_IO, "cannot initialize database file"); goto fail;
+        }
+        if (fsync(p->fd) != 0) {
+            rc = set_err(Q_ERR_IO, "cannot sync new database file"); goto fail;
+        }
         /* fresh file: discard any stale WAL from a previous crash */
-        if (ftruncate(p->wal_fd, 0) != 0) return set_err(Q_ERR_IO, "WAL truncate failed");
+        if (ftruncate(p->wal_fd, 0) != 0) {
+            rc = set_err(Q_ERR_IO, "WAL truncate failed"); goto fail;
+        }
         uint8_t wh[16] = {0};
         put32(wh, WAL_MAGIC);
-        write_full(p->wal_fd, wh, sizeof wh, 0);
+        if (write_full(p->wal_fd, wh, sizeof wh, 0) < 0) {
+            rc = set_err(Q_ERR_IO, "WAL header write failed"); goto fail;
+        }
     } else if (sz < Q_PAGE_SIZE || read_full(p->fd, hdr, Q_PAGE_SIZE, 0) != Q_PAGE_SIZE
                || get32(hdr + H_MAGIC) != DB_MAGIC) {
         rc = set_err(Q_ERR_CORRUPT, "not a quarry database (bad header)"); goto fail;
@@ -293,6 +326,8 @@ int pager_begin(struct pager *p) {
     p->in_txn = true;
     p->ndirty = 0;
     p->pending_count = p->page_count;
+    p->sp_active = false;
+    p->nundo = 0;
     return Q_OK;
 }
 
@@ -335,6 +370,8 @@ int pager_commit(struct pager *p) {
             p->page_count = p->pending_count;
             p->ndirty = 0;
             p->in_txn = false;
+            p->sp_active = false;
+            p->nundo = 0;
             int rc = pager_checkpoint(p);
             if (rc != Q_OK) return rc;
             return Q_OK;
@@ -345,6 +382,8 @@ int pager_commit(struct pager *p) {
     p->page_count = p->pending_count;
     p->ndirty = 0;
     p->in_txn = false;
+    p->sp_active = false;
+    p->nundo = 0;
     /* auto-checkpoint is best-effort: the commit is already durable, so a
        checkpoint failure must not report the transaction as failed */
     if (p->frames_since_ckpt >= 2000) pager_checkpoint(p);
@@ -354,12 +393,45 @@ int pager_commit(struct pager *p) {
 void pager_sp_mark(struct pager *p, struct pager_savepoint *sp) {
     sp->ndirty = p->ndirty;
     sp->pending = p->pending_count;
+    p->sp_active = true;
+    p->sp_ndirty = p->ndirty;
+    p->nundo = 0;
 }
+
+/* remember the pre-statement image of a page that was already dirty at the
+   mark and is about to be mutated again */
+static int undo_save(struct pager *p, int di) {
+    uint32_t pgno = p->dirty[di].pgno;
+    for (size_t i = 0; i < p->nundo; i++)
+        if (p->undo_pgno[i] == pgno) return Q_OK;
+    if (p->nundo == p->undo_cap) {
+        size_t nc = p->undo_cap ? p->undo_cap * 2 : 32;
+        uint32_t *np = realloc(p->undo_pgno, nc * sizeof *np);
+        if (!np) return set_err(Q_ERR_NOMEM, "out of memory");
+        p->undo_pgno = np;
+        uint8_t (*ni)[Q_PAGE_SIZE] = realloc(p->undo_img, nc * sizeof *ni);
+        if (!ni) return set_err(Q_ERR_NOMEM, "out of memory");
+        p->undo_img = ni;
+        p->undo_cap = nc;
+    }
+    p->undo_pgno[p->nundo] = pgno;
+    memcpy(p->undo_img[p->nundo], p->dirty[di].bytes, Q_PAGE_SIZE);
+    p->nundo++;
+    return Q_OK;
+}
+
 void pager_sp_restore(struct pager *p, const struct pager_savepoint *sp) {
-    /* every change since the mark lives only in the dirty set, so
-       truncating it restores the exact pre-statement page state */
+    /* first undo in-place edits to pages that were already dirty at the
+       mark, then drop every page the statement dirtied afterwards */
+    for (size_t i = 0; i < p->nundo; i++) {
+        int di = dirty_index(p, p->undo_pgno[i]);
+        if (di >= 0 && (size_t)di < sp->ndirty)
+            memcpy(p->dirty[di].bytes, p->undo_img[i], Q_PAGE_SIZE);
+    }
     p->ndirty = sp->ndirty;
     p->pending_count = sp->pending;
+    p->sp_active = false;
+    p->nundo = 0;
 }
 
 int pager_rollback(struct pager *p) {
@@ -367,6 +439,8 @@ int pager_rollback(struct pager *p) {
     p->ndirty = 0;
     p->pending_count = p->page_count;
     p->in_txn = false;
+    p->sp_active = false;
+    p->nundo = 0;
     return Q_OK;
 }
 
@@ -403,6 +477,12 @@ int pager_get_mut(struct pager *p, uint32_t pgno, uint8_t **page) {
             "transaction touched too many pages (limit 2048); split it up");
         memcpy(dst, src, Q_PAGE_SIZE);
         di = (int)p->ndirty - 1;
+    }
+    /* a page dirtied before the active savepoint must keep its pre-statement
+       image before it is mutated in place, or sp_restore cannot undo it */
+    if (p->sp_active && (size_t)di < p->sp_ndirty) {
+        int rc = undo_save(p, di);
+        if (rc != Q_OK) return rc;
     }
     *page = p->dirty[di].bytes;
     return Q_OK;
@@ -457,6 +537,7 @@ int pager_close(struct pager *p) {
     close(p->wal_fd);
     free(p->path); free(p->wal_path);
     free(p->dirty); free(p->wm.keys); free(p->wm.offs);
+    free(p->undo_pgno); free(p->undo_img);
     free(p);
     return rc;
 }
@@ -468,6 +549,7 @@ void pager_abandon(struct pager *p) {
     close(p->wal_fd);
     free(p->path); free(p->wal_path);
     free(p->dirty); free(p->wm.keys); free(p->wm.offs);
+    free(p->undo_pgno); free(p->undo_img);
     free(p);
 }
 

@@ -52,6 +52,13 @@ int row_decode(const struct tabledef *t, const uint8_t *buf, uint32_t len, struc
             snprintf(q_err, sizeof q_err, "corrupt row");
             return Q_ERR_CORRUPT;
         }
+        /* a field whose tag contradicts the declared column type means the
+           page contents do not come from this schema */
+        if (vals[i].type != 0 && vals[i].type != t->cols[i].type) {
+            snprintf(q_err, sizeof q_err,
+                     "corrupt row: field type does not match column type");
+            return Q_ERR_CORRUPT;
+        }
     }
     return Q_OK;
 }

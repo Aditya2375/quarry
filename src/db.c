@@ -567,7 +567,11 @@ int db_exec(struct db *d, const char *sql) {
         else rc = pager_commit(d->pg);
     } else if (have_sp && rc != Q_OK) {
         pager_sp_restore(d->pg, &sp);
-        load_catalog(d);   /* resync in-memory roots with the restored pages */
+        /* resync in-memory roots with the restored pages; if that fails the
+           in-memory catalog cannot be trusted, so report it over the
+           original statement error */
+        int crc = load_catalog(d);
+        if (crc != Q_OK) rc = crc;
     }
     return rc;
 }
