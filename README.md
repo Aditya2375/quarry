@@ -81,7 +81,12 @@ make check                    # full test suite
   `LIMIT`.
 - Strict typing: comparing or assigning a value of the wrong type
   (`WHERE name = 5` on a TEXT column) is a type error, not a coercion.
-- Single-writer, no concurrency control, no networking.
+- Single-writer, enforced: the data file is `flock`ed at open and a
+  second process gets "database is locked" instead of silently losing
+  acknowledged commits. No concurrency control beyond that, no networking.
+  If the main file is emptied or lost while the WAL still holds committed
+  data, open replays the WAL when it can and refuses with a corruption
+  error when it cannot - it never silently truncates the WAL.
 - The database file only grows (no free list); checkpoints reclaim WAL
   space, not data pages.
 

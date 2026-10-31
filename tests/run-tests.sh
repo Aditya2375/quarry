@@ -577,6 +577,58 @@ else
   echo "skip: fault-injection shim not buildable here"
 fi
 
+# R6 F1: empty main file + non-empty WAL is never silently truncated.
+# When the WAL carries the catalog page, open replays it and recovers.
+rm -f "$T/r6f1.qry" "$T/r6f1.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (42);\n.crash\n" | "$BIN" "$T/r6f1.qry" >/dev/null 2>&1 || true
+truncate -s 0 "$T/r6f1.qry"
+out=$(printf "SELECT id FROM t;\n" | "$BIN" "$T/r6f1.qry" 2>&1)
+case "$out" in
+  *"42"*) echo "ok: empty main file + WAL replays committed data";;
+  *) echo "FAIL: R6 F1 replay: [$out]"; fails=$((fails + 1));;
+esac
+
+# When the WAL's committed frames lack the catalog page, open refuses and
+# leaves the WAL untouched; removing the WAL by hand starts fresh.
+rm -f "$T/r6f1b.qry" "$T/r6f1b.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\n.checkpoint\nINSERT INTO t VALUES (2);\n.crash\n" | "$BIN" "$T/r6f1b.qry" >/dev/null 2>&1 || true
+truncate -s 0 "$T/r6f1b.qry"
+walbefore=$(stat -c %s "$T/r6f1b.qry.wal")
+out=$(printf "SELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r6f1b.qry" 2>&1 || true)
+walafter=$(stat -c %s "$T/r6f1b.qry.wal")
+case "$out" in
+  *"refusing to destroy"*) : ;;
+  *) echo "FAIL: R6 F1 refuse: [$out]"; fails=$((fails + 1));;
+esac
+if [ "$walbefore" != "$walafter" ]; then
+  echo "FAIL: R6 F1 WAL modified on refused open ($walbefore -> $walafter)"; fails=$((fails + 1))
+fi
+rm "$T/r6f1b.qry.wal"
+out=$(printf "SELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r6f1b.qry" 2>&1 || true)
+case "$out" in
+  *"no table named T"*) echo "ok: refused open preserves the WAL, manual reset works";;
+  *) echo "FAIL: R6 F1 manual reset: [$out]"; fails=$((fails + 1));;
+esac
+
+# R6 F2: a second process is refused with an honest lock error
+rm -f "$T/r6f2.qry" "$T/r6f2.qry.wal" "$T/r6f2.fifo"
+mkfifo "$T/r6f2.fifo"
+"$BIN" "$T/r6f2.qry" < "$T/r6f2.fifo" > "$T/r6f2.out" 2>&1 &
+lock_pid=$!
+{ printf "CREATE TABLE t (id INT PRIMARY KEY);\n"; sleep 2; } > "$T/r6f2.fifo" &
+sleep 1
+out=$(printf "SELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r6f2.qry" 2>&1 || true)
+case "$out" in
+  *"database is locked"*) echo "ok: second opener refused with a lock error";;
+  *) echo "FAIL: R6 F2: [$out]"; fails=$((fails + 1));;
+esac
+wait $lock_pid 2>/dev/null || true
+out=$(printf "INSERT INTO t VALUES (1);\nSELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r6f2.qry" 2>&1)
+case "$out" in
+  *"1 row inserted."*"1"*) echo "ok: lock released at close";;
+  *) echo "FAIL: R6 F2 release: [$out]"; fails=$((fails + 1));;
+esac
+
 # fuzzing: garbage SQL + on-disk corruption (shipped harness, see README)
 python3 tests/fuzz.py || fails=$((fails + 1))
 

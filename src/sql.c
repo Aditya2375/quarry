@@ -33,8 +33,6 @@ struct tok {
 struct parser {
     const char *cur;
     struct tok t;
-    char *owned[Q_MAX_COLS + 8];  /* strings to free on error */
-    int nowned;
     bool num_overflow;            /* last T_NUM did not fit in int64 */
 };
 
@@ -144,10 +142,6 @@ static int ident(struct parser *ps, char *out) {
     memcpy(out, ps->t.word, n + 1);
     next(ps); return Q_OK;
 }
-static void own(struct parser *ps, char *s) {
-    if (ps->nowned < Q_MAX_COLS + 8) ps->owned[ps->nowned++] = s;
-}
-
 static int literal(struct parser *ps, struct qval *v, char **owned) {
     if (ps->t.kind == T_NUM) {
         if (ps->num_overflow) return fail(ps, "integer literal out of range");
@@ -158,7 +152,6 @@ static int literal(struct parser *ps, struct qval *v, char **owned) {
     if (ps->t.kind == T_STR) {
         v->type = Q_COL_TEXT; v->s = ps->t.str; v->slen = (uint32_t)strlen(ps->t.str);
         *owned = ps->t.str;
-        own(ps, ps->t.str);
         ps->t.str = NULL;
         next(ps); return Q_OK;
     }

@@ -39,7 +39,10 @@ fixed-size table descriptions (name, root page, column list).
    commits could never become durable: in that case the pager is marked
    broken and rejects every further read, allocation, commit and
    checkpoint until the database is reopened (the stale tail is discarded
-   by that next open). If the in-memory map cannot absorb the commit
+   by that next open). At open, an empty main file with a non-empty WAL
+   is never silently reset: the WAL is replayed when its committed frames
+   include the catalog page, and the open refuses with a corruption error
+   (both files untouched) when they do not. If the in-memory map cannot absorb the commit
    (allocation failure), it is rebuilt by rescanning the WAL; if that
    also fails the commit reports an honest error and the WAL is left
    untouched, so the next open still recovers the data.
