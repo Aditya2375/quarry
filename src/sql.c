@@ -330,6 +330,8 @@ static int parse_tail(struct parser *ps, struct stmt *st) {
         st->has_limit = true;
         next(ps);
     }
+    if (st->kind != S_SELECT && (st->has_order || st->has_limit))
+        return fail(ps, "ORDER BY and LIMIT are only supported on SELECT");
     if (ps->t.kind == T_PUNCT && ps->t.ch == ';') next(ps);  /* optional trailing ';' */
     if (ps->t.kind != T_END) return fail(ps, "unexpected trailing input");
     return Q_OK;

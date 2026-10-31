@@ -33,6 +33,12 @@ static long find_stmt_end(const char *buf) {
     int in = 0;
     for (long i = 0; buf[i]; i++) {
         if (buf[i] == '\'') in = !in;
+        else if (!in && buf[i] == '-' && buf[i + 1] == '-') {
+            /* a '--' comment runs to the end of the line; a ';' inside it
+               is comment text, not a statement boundary */
+            while (buf[i] && buf[i] != '\n') i++;
+            if (!buf[i]) return -1;
+        }
         else if (buf[i] == ';' && !in) return i;
     }
     return -1;
@@ -52,7 +58,8 @@ int main(int argc, char **argv) {
 
     if (one) {
         if (db_exec(d, one) != Q_OK) { fprintf(stderr, "error: %s\n", q_err); db_close(d); return 1; }
-        return db_close(d) == Q_OK ? 0 : 1;
+        if (db_close(d) != Q_OK) { fprintf(stderr, "error: %s\n", q_err); return 1; }
+        return 0;
     }
 
     setvbuf(stdout, NULL, _IOLBF, 0);  /* keep stdout/stderr interleaving deterministic */
@@ -130,5 +137,6 @@ int main(int argc, char **argv) {
         }
     }
 done:
-    return db_close(d) == Q_OK ? 0 : 1;
+    if (db_close(d) != Q_OK) { fprintf(stderr, "error: %s\n", q_err); return 1; }
+    return 0;
 }

@@ -20,7 +20,7 @@
 #include <fcntl.h>
 
 #define DB_MAGIC   0x31525551u /* "QUR1" */
-#define WAL_MAGIC  0x4C415752u /* "QWAL" v2: 24-byte self-describing frames */
+#define WAL_MAGIC  0x4C415752u /* "RWAL": v2 format, 24-byte self-describing frames */
 #define FRAME_MAGIC 0x4D415246u /* "FRAM" */
 /* frame header v2: magic, pgno, commit_pages, txn_frames, crc, reserved.
    txn_frames is set on the commit frame only and says how many frames the
@@ -208,13 +208,15 @@ static int walmap_put(struct pager *p, uint32_t pgno, uint64_t off) {
 /* ---------- open / recover ---------- */
 static int wal_recover(struct pager *p) {
     uint8_t hdr[16];
-    if (read_full(p->wal_fd, hdr, sizeof hdr, 0) != (ssize_t)sizeof hdr ||
-        get32(hdr) != WAL_MAGIC) {
-        /* empty, foreign or half-written WAL: nothing replayable. Reset it
-           rather than ignoring it - appending after garbage would strand
-           future commits behind bytes recovery can never cross */
-        if (ftruncate(p->wal_fd, 0) != 0)
-            return set_err(Q_ERR_IO, "WAL reset failed");
+    ssize_t hr = read_full(p->wal_fd, hdr, sizeof hdr, 0);
+    if (hr > 0 && get32(hdr) != WAL_MAGIC)
+        /* a non-empty WAL we do not recognize may hold committed data
+           (older format, torn header). Never erase it: fail the open. */
+        return set_err(Q_ERR_CORRUPT, "WAL has an unknown format - not truncating it away");
+    if (hr < (ssize_t)sizeof hdr) {
+        /* a truly empty WAL is initialized; anything else already failed
+           above with a corrupt error */
+        if (hr != 0) return set_err(Q_ERR_CORRUPT, "WAL header is torn - not truncating it away");
         uint8_t wh[16] = {0};
         put32(wh, WAL_MAGIC);
         if (write_full(p->wal_fd, wh, sizeof wh, 0) < 0)
@@ -382,15 +384,22 @@ int pager_commit(struct pager *p) {
         put32(fh + 16, crc32_frame(fh, p->dirty[i].bytes));
         if (write_full(p->wal_fd, fh, sizeof fh, off) < 0 ||
             write_full(p->wal_fd, p->dirty[i].bytes, Q_PAGE_SIZE, off + FRAME_HDR) < 0) {
-            if (ftruncate(p->wal_fd, (off_t)start) != 0)
-                return set_err(Q_ERR_IO, "WAL write failed (partial frames may linger until the next checkpoint)");
+            if (ftruncate(p->wal_fd, (off_t)start) != 0) {
+                /* partial frames linger and recovery will not fold past
+                   them, so later commits would report success but never
+                   become durable. Refuse all further work instead. */
+                p->broken = true;
+                return set_err(Q_ERR_IO, "WAL write failed and the partial tail could not be removed - reopen the database");
+            }
             return set_err(Q_ERR_IO, "WAL write failed");
         }
         off += FRAME_HDR + Q_PAGE_SIZE;
     }
     if (fsync(p->wal_fd) < 0) {
-        if (ftruncate(p->wal_fd, (off_t)start) != 0)
-            return set_err(Q_ERR_IO, "WAL fsync failed (partial frames may linger until the next checkpoint)");
+        if (ftruncate(p->wal_fd, (off_t)start) != 0) {
+            p->broken = true;
+            return set_err(Q_ERR_IO, "WAL fsync failed and the partial tail could not be removed - reopen the database");
+        }
         return set_err(Q_ERR_IO, "WAL fsync failed");
     }
     off = start;
@@ -487,6 +496,7 @@ int pager_rollback(struct pager *p) {
 
 /* ---------- page access ---------- */
 int pager_get(struct pager *p, uint32_t pgno, const uint8_t **page) {
+    if (p->broken) return set_err(Q_ERR_IO, "pager unusable after a WAL map failure - reopen the database");
     if (pgno >= p->pending_count)
         return set_err(Q_ERR_CORRUPT, "page out of range");
     int di = dirty_index(p, pgno);
@@ -530,6 +540,7 @@ int pager_get_mut(struct pager *p, uint32_t pgno, uint8_t **page) {
 }
 
 int pager_alloc(struct pager *p, uint32_t *pgno, uint8_t **page) {
+    if (p->broken) return set_err(Q_ERR_IO, "pager unusable after a WAL map failure - reopen the database");
     if (!p->in_txn) return set_err(Q_ERR_TXN, "allocate outside a transaction");
     if (p->ndirty >= Q_TXN_MAX_PAGES)
         return set_err(Q_ERR_TOO_BIG, "transaction touched too many pages (limit 2048)");

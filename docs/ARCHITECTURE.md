@@ -34,7 +34,12 @@ fixed-size table descriptions (name, root page, column list).
    updated and the commit reported successful. If any write or the fsync
    fails, the partial frame tail is truncated back: the WAL looks exactly
    as it did before the commit, and the still-open transaction can be
-   rolled back or retried. If the in-memory map cannot absorb the commit
+   rolled back or retried. If the tail truncate itself fails, the partial
+   frames linger and recovery would refuse to fold past them, so later
+   commits could never become durable: in that case the pager is marked
+   broken and rejects every further read, allocation, commit and
+   checkpoint until the database is reopened (the stale tail is discarded
+   by that next open). If the in-memory map cannot absorb the commit
    (allocation failure), it is rebuilt by rescanning the WAL; if that
    also fails the commit reports an honest error and the WAL is left
    untouched, so the next open still recovers the data.

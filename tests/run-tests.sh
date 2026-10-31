@@ -426,6 +426,103 @@ if [ "$out" = "ID
 3
 (3 rows)" ]; then echo "ok: persistent walmap failure leaves WAL intact, reopen recovers"; else echo "FAIL: persistent walmap recovery: [$out]"; fails=$((fails + 1)); fi
 
+# ---- round-4 regressions ----------------------------------------------
+
+# N1: a non-empty WAL with an unknown magic must fail the open, never be
+# truncated away
+rm -f "$T/r4n1.qry" "$T/r4n1.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY, v INT);\nINSERT INTO t VALUES (1, 1);\n.crash\n" | "$BIN" "$T/r4n1.qry" > /dev/null 2>&1 || true
+python3 -c "
+import sys
+p = '$T/r4n1.qry.wal'
+d = open(p, 'r+b'); d.write(b'XXXX'); d.close()"
+sum_before=$(md5sum "$T/r4n1.qry.wal" | cut -d' ' -f1)
+out=$(printf ".tables\n" | "$BIN" "$T/r4n1.qry" 2>&1) && rc=0 || rc=$?
+sum_after=$(md5sum "$T/r4n1.qry.wal" | cut -d' ' -f1)
+if [ $rc -ne 0 ] && [ "$sum_before" = "$sum_after" ] && echo "$out" | grep -q "unknown format"; then
+  echo "ok: foreign WAL rejected, never truncated"
+else
+  echo "FAIL: foreign WAL handling (rc=$rc out=[$out])"; fails=$((fails + 1))
+fi
+
+# N3: ORDER BY / LIMIT are rejected on non-SELECT statements instead of
+# being silently ignored
+rm -f "$T/r4n3.qry" "$T/r4n3.qry.wal"
+out=$(printf "CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2);\nDELETE FROM t WHERE id > 0 LIMIT 1;\nUPDATE t SET id = 9 ORDER BY id;\nINSERT INTO t VALUES (3) LIMIT 1;\nSELECT COUNT(*) FROM t;\n" | "$BIN" "$T/r4n3.qry" 2>&1)
+n_err=$(echo "$out" | grep -c "only supported on SELECT")
+n_rows=$(echo "$out" | awk '/^count$/{getline; print}')
+if [ "$n_err" = "3" ] && [ "$n_rows" = "2" ]; then
+  echo "ok: ORDER BY/LIMIT rejected off SELECT"
+else
+  echo "FAIL: LIMIT/ORDER rejection (errs=$n_err rows=$n_rows)"; fails=$((fails + 1))
+fi
+
+# N4: a broken pager refuses reads and allocations, not just writes
+rm -f "$T/r4n4.qry" "$T/r4n4.qry.wal"
+printf "CREATE TABLE t (id INT PRIMARY KEY);\n" | "$BIN" "$T/r4n4.qry" > /dev/null
+out=$(QUARRY_WALMAP_FAIL_AFTER=1 sh -c "printf 'INSERT INTO t VALUES (1);\nSELECT COUNT(*) FROM t;\nCREATE TABLE u (id INT PRIMARY KEY);\n' | '$BIN' '$T/r4n4.qry'" 2>&1)
+n_unusable=$(echo "$out" | grep -c "pager unusable")
+if [ "$n_unusable" -ge 2 ] && ! echo "$out" | grep -q "row inserted\|table U created"; then
+  echo "ok: broken pager refuses reads and allocations"
+else
+  echo "FAIL: broken pager served work: [$out]"; fails=$((fails + 1))
+fi
+
+# N5: a ';' inside a '--' comment is not a statement boundary
+rm -f "$T/r4n5.qry" "$T/r4n5.qry.wal"
+out=$(printf -- "-- drop; everything\nCREATE TABLE c1 (id INT PRIMARY KEY);\nSELECT COUNT(*) FROM c1;\n" | "$BIN" "$T/r4n5.qry" 2>&1)
+case "$out" in
+  *"table C1 created."*"0"*) echo "ok: semicolon inside comment is not a boundary";;
+  *) echo "FAIL: comment semicolon: [$out]"; fails=$((fails + 1));;
+esac
+
+# N2 + N6: syscall fault injection via LD_PRELOAD shim (skipped where the
+# shim cannot be built, e.g. non-Linux CI without -ldl)
+# under ASan the binary must be first in LD_PRELOAD, so the shim cannot be
+# preloaded into it; the shim cases run in the normal test job instead
+if ldd "$BIN" 2>/dev/null | grep -qi 'asan'; then
+  echo "skip: fault-injection shim incompatible with the ASan runtime"
+elif cc -shared -fPIC -O2 tests/shim.c -o "$T/shim.so" -ldl 2>/dev/null; then
+  # N2: WAL write fails AND the tail truncate fails: the commit reports an
+  # honest error, no success line prints, and later statements in the same
+  # session are refused instead of being silently lost
+  rm -f "$T/r4n2.qry" "$T/r4n2.qry.wal" "$T/r4n2.mark" "$T/r4n2.fifo"
+  mkfifo "$T/r4n2.fifo"
+  QSHIM=1 QSHIM_MARKER="$T/r4n2.mark" QSHIM_FAIL_WRITE=1 QSHIM_FAIL_TRUNCATE=1 \
+    LD_PRELOAD="$T/shim.so" "$BIN" "$T/r4n2.qry" < "$T/r4n2.fifo" > "$T/r4n2.out" 2> "$T/r4n2.err" &
+  shim_pid=$!
+  { sleep 1; touch "$T/r4n2.mark"; printf "CREATE TABLE w (id INT PRIMARY KEY);\nINSERT INTO w VALUES (1);\n"; sleep 1; } > "$T/r4n2.fifo"
+  wait $shim_pid
+  if grep -q "could not be removed" "$T/r4n2.err" \
+     && grep -q "pager unusable" "$T/r4n2.err" \
+     && ! grep -q "table W created\|row inserted" "$T/r4n2.out"; then
+    echo "ok: write+truncate failure breaks the pager, no silent loss"
+  else
+    echo "FAIL: N2 (see $T/r4n2.out and $T/r4n2.err)"; fails=$((fails + 1))
+  fi
+  out=$(printf ".tables\nCREATE TABLE q (id INT PRIMARY KEY);\nINSERT INTO q VALUES (1);\nSELECT COUNT(*) FROM q;\n" | "$BIN" "$T/r4n2.qry" 2>&1)
+  case "$out" in
+    *"(no tables)"*"table Q created."*"1"*) echo "ok: reopen after broken commit recovers cleanly";;
+    *) echo "FAIL: reopen after broken commit: [$out]"; fails=$((fails + 1));;
+  esac
+
+  # N6: a db_close failure exits 1 and says why on stderr
+  rm -f "$T/r4n6.qry" "$T/r4n6.qry.wal" "$T/r4n6.mark" "$T/r4n6.fifo"
+  mkfifo "$T/r4n6.fifo"
+  QSHIM=1 QSHIM_MARKER="$T/r4n6.mark" QSHIM_FAIL_TRUNCATE=1 \
+    LD_PRELOAD="$T/shim.so" "$BIN" "$T/r4n6.qry" < "$T/r4n6.fifo" > "$T/r4n6.out" 2> "$T/r4n6.err" &
+  shim_pid=$!
+  { printf "CREATE TABLE z (id INT PRIMARY KEY);\n"; sleep 1; touch "$T/r4n6.mark"; } > "$T/r4n6.fifo"
+  wait $shim_pid && rc=0 || rc=$?
+  if [ $rc -eq 1 ] && grep -q "error:" "$T/r4n6.err"; then
+    echo "ok: db_close failure exits 1 with a stderr message"
+  else
+    echo "FAIL: db_close failure silent (rc=$rc, see $T/r4n6.err)"; fails=$((fails + 1))
+  fi
+else
+  echo "skip: fault-injection shim not buildable here"
+fi
+
 # fuzzing: garbage SQL + on-disk corruption (shipped harness, see README)
 python3 tests/fuzz.py || fails=$((fails + 1))
 
