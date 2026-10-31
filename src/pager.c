@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <errno.h>
 
 #define DB_MAGIC   0x31525551u /* "QUR1" */
 #define WAL_MAGIC  0x4C415752u /* "RWAL": v2 format, 24-byte self-describing frames */
@@ -308,7 +309,15 @@ int pager_open(struct pager **out, const char *path) {
        crash. A second process gets an honest error instead of silently
        losing acknowledged commits. */
     if (flock(p->fd, LOCK_EX | LOCK_NB) != 0) {
-        rc = set_err(Q_ERR_IO, "database is locked by another process"); goto fail;
+        if (errno == EWOULDBLOCK)
+            rc = set_err(Q_ERR_IO, "database is locked by another process");
+        else {
+            /* e.g. ENOLCK on a network filesystem: say what really failed */
+            char msg[128];
+            snprintf(msg, sizeof msg, "cannot lock database file: %s", strerror(errno));
+            rc = set_err(Q_ERR_IO, msg);
+        }
+        goto fail;
     }
 #endif
     fsync_dir(path);

@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/file.h>
 #include <errno.h>
 #include <stdio.h>
 
@@ -56,6 +57,13 @@ static int is_db(int fd) {
     path[n] = 0;
     size_t l = strlen(path);
     return l >= 4 && !strcmp(path + l - 4, ".qry");
+}
+
+int flock(int fd, int op) {
+    static int (*real)(int, int);
+    if (!real) real = dlsym(RTLD_NEXT, "flock");
+    if (armed() && getenv("QSHIM_FAIL_FLOCK")) { errno = ENOLCK; return -1; }
+    return real(fd, op);
 }
 
 int fsync(int fd) {

@@ -653,6 +653,22 @@ esac
 if [ "$m1" = "$m2" ]; then echo "ok: refused open leaves garbage tail intact"
 else echo "FAIL: R7 garbage tail trimmed on refused open"; fails=$((fails + 1)); fi
 
+# R7: a flock failure that is NOT contention (e.g. ENOLCK on a network
+# filesystem) says what really failed instead of claiming contention
+rm -f "$T/r7lock.qry" "$T/r7lock.qry.wal" "$T/r7lock.mark"
+if ldd "$BIN" 2>/dev/null | grep -qi 'asan'; then
+  echo "skip: fault-injection shim incompatible with the ASan runtime"
+elif cc -shared -fPIC -O2 tests/shim.c -o "$T/shim.so" -ldl 2>/dev/null; then
+  out=$(printf ".tables\n" | QSHIM=1 QSHIM_FAIL_FLOCK=1 LD_PRELOAD="$T/shim.so" "$BIN" "$T/r7lock.qry" 2>&1 || true)
+  case "$out" in
+    *"cannot lock database file:"*"No locks available"*) echo "ok: non-contention lock failure is honest";;
+    *"cannot lock database file:"*) echo "ok: non-contention lock failure is honest";;
+    *) echo "FAIL: R7 flock errno: [$out]"; fails=$((fails + 1));;
+  esac
+else
+  echo "skip: fault-injection shim not buildable here"
+fi
+
 # R6 F2: a second process is refused with an honest lock error
 rm -f "$T/r6f2.qry" "$T/r6f2.qry.wal" "$T/r6f2.fifo"
 mkfifo "$T/r6f2.fifo"
